@@ -1,0 +1,227 @@
+# app/config/llm/llm_orchestration.yaml
+# ---------------------------------------------------------------------------
+# DEPRECATED — DO NOT EDIT
+# ---------------------------------------------------------------------------
+# This combined file has been superseded by the three-file split layout:
+#
+#   app/config/llm/llm_routes.yaml          — routing table
+#   app/config/llm/model_registry.yaml      — model catalog (new aliases)
+#   app/config/llm/provider_profiles.yaml   — provider connection metadata
+#
+# This file is kept ONLY for backward compatibility with LlmConfigRegistry
+# tests that inject inline YAML via  LlmConfigRegistry(yaml_path=...).
+# The production registry no longer reads this file.
+#
+# LlmConfigRegistry() with no arguments now loads from the three split files.
+# ---------------------------------------------------------------------------
+
+version: 1
+
+routes:
+  math:
+    generator:
+      default:
+        model: gemini_flash_light
+        prompt: subjects/math_generator.md
+        temperature: 0.2
+        max_tokens: 800
+        fallback:
+          - general_default
+          - safe_mock
+
+      basic:
+        inherits: default
+        overlays:
+          - levels/basic.md
+        max_tokens: 800
+        fallback:
+          - default
+          - general_default
+          - safe_mock
+
+      intermediate:
+        inherits: default
+        overlays:
+          - levels/intermediate.md
+        max_tokens: 900
+        fallback:
+          - basic
+          - default
+          - general_default
+          - safe_mock
+
+      advanced:
+        inherits: default
+        model: gemini_flash_reasoning_light
+        overlays:
+          - levels/advanced.md
+        temperature: 0.15
+        max_tokens: 1000
+        provider_options:
+          thinking: true
+        fallback:
+          - intermediate
+          - default
+          - general_default
+          - safe_mock
+
+  reasoning:
+    generator:
+      default:
+        model: gemini_flash_reasoning_light
+        prompt: subjects/reasoning_generator.md
+        temperature: 0.2
+        max_tokens: 900
+        fallback:
+          - general_default
+          - safe_mock
+
+      basic:
+        inherits: default
+        overlays:
+          - levels/basic.md
+        max_tokens: 800
+        fallback:
+          - default
+          - general_default
+          - safe_mock
+
+      intermediate:
+        inherits: default
+        overlays:
+          - levels/intermediate.md
+        max_tokens: 900
+        fallback:
+          - basic
+          - default
+          - general_default
+          - safe_mock
+
+      advanced:
+        inherits: default
+        overlays:
+          - levels/advanced.md
+        max_tokens: 1000
+        fallback:
+          - intermediate
+          - default
+          - general_default
+          - safe_mock
+
+  english:
+    generator:
+      default:
+        model: gemini_flash_light
+        prompt: subjects/english_generator.md
+        temperature: 0.3
+        max_tokens: 800
+        fallback:
+          - general_default
+          - safe_mock
+
+      basic:
+        inherits: default
+        overlays:
+          - levels/basic.md
+        max_tokens: 700
+        fallback:
+          - default
+          - general_default
+          - safe_mock
+
+      intermediate:
+        inherits: default
+        overlays:
+          - levels/intermediate.md
+        max_tokens: 800
+        fallback:
+          - basic
+          - default
+          - general_default
+          - safe_mock
+
+      advanced:
+        inherits: default
+        overlays:
+          - levels/advanced.md
+        max_tokens: 900
+        fallback:
+          - intermediate
+          - default
+          - general_default
+          - safe_mock
+
+  general:
+    generator:
+      default:
+        model: gemini_flash_light
+        prompt: subjects/general_generator.md
+        temperature: 0.3
+        max_tokens: 800
+        fallback:
+          - safe_mock
+
+models:
+  gemini_flash_light:
+    provider: gemini
+    provider_profile: gemini_primary
+    model_id: gemini-2.5-flash
+    model_label: gemini-flash-light
+    cost_tier: low
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 20
+    capabilities:
+      math: medium
+      reasoning: medium
+      english: medium
+      general: medium
+
+  gemini_flash_reasoning_light:
+    provider: gemini
+    provider_profile: gemini_primary
+    model_id: gemini-2.5-flash
+    model_label: gemini-flash-reasoning-light
+    cost_tier: low
+    supports_streaming: true
+    supports_thinking: true
+    timeout_seconds: 25
+    capabilities:
+      math: high
+      reasoning: high
+      english: medium
+      general: medium
+
+  safe_mock:
+    provider: mock
+    provider_profile: local_mock
+    model_id: local-mock
+    model_label: safe-mock
+    cost_tier: none
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 1
+    capabilities:
+      math: low
+      reasoning: low
+      english: low
+      general: low
+
+provider_profiles:
+  gemini_primary:
+    provider: gemini
+    api_key_env: GEMINI_API_KEY
+
+  azure_primary:
+    provider: azure_openai
+    endpoint_env: AZURE_OPENAI_ENDPOINT
+    api_key_env: AZURE_OPENAI_API_KEY
+    api_version_env: AZURE_OPENAI_API_VERSION
+
+  openai_primary:
+    provider: openai
+    api_key_env: OPENAI_API_KEY
+    base_url_env: OPENAI_BASE_URL
+
+  local_mock:
+    provider: mock

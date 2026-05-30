@@ -1,0 +1,681 @@
+"""
+app/tests/test_orchestrated_classifier_routing.py
+---------------------------------------------------
+Tests for the orchestrated Azure-first classifier path.
+
+Covers:
+- doubt_solver_classifier alias exists in model registry with azure_openai provider
+- doubt_solver_classifier_openai_native alias exists as fallback (openai provider)
+- general.classifier.default route exists in llm_routes.yaml pointing to
+  doubt_solver_classifier model
+- classify_query dispatches to orchestrated path when
+  ENABLE_ORCHESTRATED_DOUBT_SOLVER=true and ENABLE_REAL_LLM=true
+- orchestrated path falls back to deterministic when LlmOrchestrator raises
+- legacy model_router path still used when ENABLE_ORCHESTRATED_DOUBT_SOLVER=false
+- _get_classifier_orchestrator returns the same object on repeated calls (singleton)
+- _get_classifier_orchestrator singleton can be reset for test isolation
+- _warn_placeholder_deployments emits a WARNING for placeholder deployment names
+
+No real provider calls in any test.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+import config as cfg_module
+import services.query_classifier_service as classifier_module
+from schemas.doubt_solver import QueryClassification
+from services.query_classifier_service import (
+    _CLASSIFIER_ROLE,
+    classify_query,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _reset_settings() -> None:
+    cfg_module._settings = None
+
+
+def _reset_orchestrator() -> None:
+    """Reset the orchestrator singleton so tests start with a clean state."""
+    classifier_module._classifier_orchestrator = None
+
+
+def _make_valid_classification_json(
+    intent: str = "solve_question",
+    subject: str = "math",
+    confidence: float = 0.9,
+) -> str:
+    return json.dumps(
+        {
+            "intent": intent,
+            "subject": subject,
+            "topic": "algebra",
+            "response_style": "step_by_step",
+            "confidence": confidence,
+            "retrieval_need": "none",
+            "reasoning_summary": "Math question",
+        }
+    )
+
+
+@pytest.fixture(autouse=True)
+def reset_singletons(monkeypatch):
+    """Reset Settings and orchestrator singleton between every test."""
+    _reset_settings()
+    _reset_orchestrator()
+    yield
+    _reset_settings()
+    _reset_orchestrator()
+
+
+# ---------------------------------------------------------------------------
+# Part B — YAML config presence checks (registry + routes)
+# ---------------------------------------------------------------------------
+
+
+class TestModelRegistryClassifierAliases:
+    """doubt_solver_classifier and its fallback must exist in model_registry.yaml."""
+
+    def _load_registry(self):
+        """Return the raw LlmConfigRegistry (real YAML, no providers)."""
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        return LlmConfigRegistry()
+
+    def test_primary_alias_exists(self):
+        registry = self._load_registry()
+        assert "doubt_solver_classifier" in registry.model_map
+
+    def test_primary_alias_is_azure_openai(self):
+        registry = self._load_registry()
+        model = registry.model_map["doubt_solver_classifier"]
+        assert model.provider == "azure_openai"
+
+    def test_primary_alias_has_fallback(self):
+        registry = self._load_registry()
+        model = registry.model_map["doubt_solver_classifier"]
+        assert "doubt_solver_classifier_openai_native" in (model.fallback_models or [])
+
+    def test_native_fallback_alias_exists(self):
+        registry = self._load_registry()
+        assert "doubt_solver_classifier_openai_native" in registry.model_map
+
+    def test_native_fallback_alias_is_openai(self):
+        registry = self._load_registry()
+        model = registry.model_map["doubt_solver_classifier_openai_native"]
+        assert model.provider == "openai"
+
+    def test_native_fallback_has_no_further_fallback(self):
+        """Fallback chain is intentionally shallow — native alias has no further fallback."""
+        registry = self._load_registry()
+        model = registry.model_map["doubt_solver_classifier_openai_native"]
+        assert not (model.fallback_models or [])
+
+    def test_primary_supports_streaming_false(self):
+        registry = self._load_registry()
+        model = registry.model_map["doubt_solver_classifier"]
+        assert model.supports_streaming is False
+
+    def test_native_fallback_supports_streaming_false(self):
+        registry = self._load_registry()
+        model = registry.model_map["doubt_solver_classifier_openai_native"]
+        assert model.supports_streaming is False
+
+
+class TestLlmRoutesClassifierRoute:
+    """general.classifier.default route must exist and point to doubt_solver_classifier."""
+
+    def _load_registry(self):
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        return LlmConfigRegistry()
+
+    def test_classifier_route_exists(self):
+        registry = self._load_registry()
+        # Route key is (subject, task_role, difficulty)
+        key = ("general", "classifier", "default")
+        assert key in registry.route_map, (
+            "Route general.classifier.default not found. "
+            f"Keys: {list(registry.route_map.keys())[:10]}"
+        )
+
+    def test_classifier_route_points_to_correct_model(self):
+        registry = self._load_registry()
+        route = registry.route_map[("general", "classifier", "default")]
+        assert route.model == "doubt_solver_classifier"
+
+    def test_classifier_route_prompt_set(self):
+        registry = self._load_registry()
+        route = registry.route_map[("general", "classifier", "default")]
+        assert route.prompt, "Classifier route must have a prompt."
+
+
+# ---------------------------------------------------------------------------
+# Part C — classify_query orchestrated dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyQueryOrchestratedDispatch:
+    """classify_query must use orchestrated path when ENABLE_ORCHESTRATED_DOUBT_SOLVER=true."""
+
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_REAL_LLM", "true")
+        monkeypatch.setenv("ENABLE_ORCHESTRATED_DOUBT_SOLVER", "true")
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", "{}")
+        _reset_settings()
+
+    def test_dispatches_to_orchestrated_path(self, monkeypatch):
+        """When flag=true, classify_query calls _classify_with_llm_orchestrated_or_fallback."""
+        self._env(monkeypatch)
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated_or_fallback",
+            return_value=QueryClassification(
+                intent="solve_question",
+                subject="math",
+                topic="algebra",
+                response_style="step_by_step",
+                confidence=0.9,
+                retrieval_need="none",
+                reasoning_summary="",
+                classification_source="llm",
+            ),
+        ) as mock_fn:
+            result = classify_query("What is 2+2?")
+        mock_fn.assert_called_once_with("What is 2+2?", request_id=None)
+        assert result.classification_source == "llm"
+
+    def test_does_not_call_legacy_model_router_when_orchestrated(self, monkeypatch):
+        """Legacy model_router must not be called when orchestrated path is active."""
+        self._env(monkeypatch)
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated_or_fallback",
+            return_value=QueryClassification(
+                intent="explain_concept",
+                subject="general",
+                topic="test",
+                response_style="short_answer",
+                confidence=0.8,
+                retrieval_need="none",
+                reasoning_summary="",
+                classification_source="llm",
+            ),
+        ), patch.object(
+            classifier_module,
+            "_classify_with_llm",
+        ) as legacy_mock:
+            classify_query("Explain gravity")
+        legacy_mock.assert_not_called()
+
+
+class TestClassifyQueryLegacyPathPreserved:
+    """Legacy model_router path must still work when ENABLE_ORCHESTRATED_DOUBT_SOLVER=false."""
+
+    def _env(self, monkeypatch, role_config: dict):
+        monkeypatch.setenv("ENABLE_REAL_LLM", "true")
+        monkeypatch.setenv("ENABLE_ORCHESTRATED_DOUBT_SOLVER", "false")
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", json.dumps(role_config))
+        _reset_settings()
+
+    def test_falls_back_to_deterministic_when_role_not_in_config(self, monkeypatch):
+        self._env(monkeypatch, {})
+        result = classify_query("What is the derivative of x^2?")
+        assert result.classification_source in ("deterministic", "llm", "fallback")
+
+    def test_calls_legacy_llm_or_fallback_when_role_in_config(self, monkeypatch):
+        self._env(monkeypatch, {_CLASSIFIER_ROLE: {"provider": "mock"}})
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_or_fallback",
+            return_value=QueryClassification(
+                intent="solve_question",
+                subject="math",
+                topic="calc",
+                response_style="step_by_step",
+                confidence=0.9,
+                retrieval_need="none",
+                reasoning_summary="",
+                classification_source="llm",
+            ),
+        ) as mock_fn:
+            classify_query("Integrate x^2")
+        mock_fn.assert_called_once()
+
+    def test_does_not_call_orchestrated_path(self, monkeypatch):
+        self._env(monkeypatch, {})
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated_or_fallback",
+        ) as mock_fn:
+            classify_query("What is calculus?")
+        mock_fn.assert_not_called()
+
+
+class TestOrchestratedClassifierOrFallback:
+    """_classify_with_llm_orchestrated_or_fallback must fall back to deterministic on errors."""
+
+    def test_falls_back_on_provider_error(self, monkeypatch):
+        from services.llm.orchestration.errors import ProviderExecutionError
+
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=ProviderExecutionError("All providers failed"),
+        ):
+            result = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "Solve 3x=9"
+            )
+        assert result.classification_source == "fallback"
+        assert result.confidence <= 0.55
+
+    def test_falls_back_on_json_decode_error(self, monkeypatch):
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=ValueError("Bad JSON"),
+        ):
+            result = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "What is DNA?"
+            )
+        assert result.classification_source == "fallback"
+
+    def test_returns_llm_result_on_success(self, monkeypatch):
+        expected = QueryClassification(
+            intent="explain_concept",
+            subject="english",
+            topic="grammar",
+            response_style="simple_explanation",
+            confidence=0.85,
+            retrieval_need="none",
+            reasoning_summary="",
+            classification_source="llm",
+        )
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            return_value=expected,
+        ):
+            result = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "What is a noun?"
+            )
+        assert result.intent == "explain_concept"
+        assert result.classification_source == "llm"
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator singleton
+# ---------------------------------------------------------------------------
+
+
+class TestClassifierOrchestratorSingleton:
+    """_get_classifier_orchestrator must return the same object on repeated calls."""
+
+    def test_singleton_returns_same_instance(self):
+        """After first build, returns cached object."""
+        _reset_orchestrator()
+        mock_orchestrator = MagicMock()
+        # Inject the mock directly — bypasses lazy wiring
+        classifier_module._classifier_orchestrator = mock_orchestrator
+        o1 = classifier_module._get_classifier_orchestrator()
+        o2 = classifier_module._get_classifier_orchestrator()
+        assert o1 is o2
+        assert o1 is mock_orchestrator
+
+    def test_singleton_reset_is_none(self):
+        """After reset, singleton is None until next call builds it."""
+        _reset_orchestrator()
+        assert classifier_module._classifier_orchestrator is None
+
+
+# ---------------------------------------------------------------------------
+# Part D — Placeholder deployment warnings
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceholderDeploymentWarnings:
+    """_warn_placeholder_deployments must log a WARNING for YOUR_* names.
+
+    NOTE: model_registry.yaml currently has real deployment names (gpt-4o,
+    gpt-4o-mini) — no YOUR_* placeholders.  These tests verify the warning
+    mechanism works correctly when placeholders ARE present (via an inline
+    registry) rather than asserting the production registry has placeholders.
+    """
+
+    def test_warns_for_placeholder_deployment_in_inline_registry(self, tmp_path, caplog):
+        """When model_registry.yaml has YOUR_* deployments, warnings are emitted."""
+        import textwrap
+
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        yaml_text = textwrap.dedent("""\
+            version: 1
+            routes:
+              general:
+                generator:
+                  default:
+                    model: azure_placeholder
+                    prompt: subjects/general_generator.md
+                    temperature: 0.3
+                    max_tokens: 800
+            models:
+              safe_mock:
+                provider: mock
+                provider_profile: local_mock
+                model_label: safe-mock
+                cost_tier: none
+                supports_streaming: false
+                supports_thinking: false
+                timeout_seconds: 1
+              azure_placeholder:
+                provider: azure_openai
+                provider_profile: azure_primary
+                deployment: YOUR_AZURE_DEPLOYMENT_NAME
+                model_label: azure-placeholder
+                cost_tier: medium
+                supports_streaming: false
+                supports_thinking: false
+                timeout_seconds: 30
+            provider_profiles:
+              local_mock:
+                provider: mock
+              azure_primary:
+                provider: azure_openai
+                api_key_env: AZURE_OPENAI_API_KEY
+                endpoint_env: AZURE_OPENAI_ENDPOINT
+                api_version_env: AZURE_OPENAI_API_VERSION
+        """)
+        yaml_path = tmp_path / "llm_orchestration.yaml"
+        yaml_path.write_text(yaml_text)
+
+        with caplog.at_level(logging.WARNING):
+            LlmConfigRegistry(yaml_path=yaml_path)
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        placeholder_warnings = [m for m in warning_messages if "placeholder" in m.lower()]
+        assert len(placeholder_warnings) >= 1, (
+            f"Expected ≥1 placeholder warning for YOUR_* deployment. "
+            f"Got: {placeholder_warnings}"
+        )
+
+    def test_warning_includes_alias_name_for_placeholder(self, tmp_path, caplog):
+        """Warning message includes the model alias with the placeholder deployment."""
+        import textwrap
+
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        yaml_text = textwrap.dedent("""\
+            version: 1
+            routes:
+              general:
+                generator:
+                  default:
+                    model: my_azure_model
+                    prompt: subjects/general_generator.md
+                    temperature: 0.3
+                    max_tokens: 800
+            models:
+              safe_mock:
+                provider: mock
+                provider_profile: local_mock
+                model_label: safe-mock
+                cost_tier: none
+                supports_streaming: false
+                supports_thinking: false
+                timeout_seconds: 1
+              my_azure_model:
+                provider: azure_openai
+                provider_profile: azure_primary
+                deployment: YOUR_GPT4O_DEPLOYMENT
+                model_label: azure-model
+                cost_tier: medium
+                supports_streaming: false
+                supports_thinking: false
+                timeout_seconds: 30
+            provider_profiles:
+              local_mock:
+                provider: mock
+              azure_primary:
+                provider: azure_openai
+                api_key_env: AZURE_OPENAI_API_KEY
+                endpoint_env: AZURE_OPENAI_ENDPOINT
+                api_version_env: AZURE_OPENAI_API_VERSION
+        """)
+        yaml_path = tmp_path / "llm_orchestration.yaml"
+        yaml_path.write_text(yaml_text)
+
+        with caplog.at_level(logging.WARNING):
+            LlmConfigRegistry(yaml_path=yaml_path)
+
+        messages = " ".join(r.message for r in caplog.records if r.levelno == logging.WARNING)
+        assert "my_azure_model" in messages or "YOUR_GPT4O_DEPLOYMENT" in messages
+
+    def test_production_registry_has_no_placeholder_deployments(self, caplog):
+        """Confirm model_registry.yaml has NO YOUR_* placeholder deployments.
+
+        All deployment names are real (gpt-4o, gpt-4o-mini).
+        If this test fails, someone re-introduced a placeholder — update model_registry.yaml.
+        """
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        with caplog.at_level(logging.WARNING):
+            LlmConfigRegistry()
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        placeholder_warnings = [m for m in warning_messages if "placeholder" in m.lower()]
+        assert placeholder_warnings == [], (
+            f"Production model_registry.yaml has YOUR_* placeholder deployments — "
+            f"replace them with real Azure deployment names.\n"
+            f"Placeholder warnings: {placeholder_warnings}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Part E — request_id propagation (Part A fix coverage)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyQueryRequestIdPropagation:
+    """request_id must be threaded from classify_query down to the orchestrated path."""
+
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_REAL_LLM", "true")
+        monkeypatch.setenv("ENABLE_ORCHESTRATED_DOUBT_SOLVER", "true")
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", "{}")
+        _reset_settings()
+
+    def test_request_id_propagated_when_provided(self, monkeypatch):
+        self._env(monkeypatch)
+        _good_result = QueryClassification(
+            intent="solve_question",
+            subject="math",
+            topic="algebra",
+            response_style="step_by_step",
+            confidence=0.9,
+            retrieval_need="none",
+            reasoning_summary="",
+            classification_source="llm",
+        )
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated_or_fallback",
+            return_value=_good_result,
+        ) as mock_fn:
+            classify_query("What is 2+2?", request_id="req-abc")
+        mock_fn.assert_called_once_with("What is 2+2?", request_id="req-abc")
+
+    def test_request_id_none_when_not_provided(self, monkeypatch):
+        self._env(monkeypatch)
+        _good_result = QueryClassification(
+            intent="solve_question",
+            subject="math",
+            topic="algebra",
+            response_style="step_by_step",
+            confidence=0.9,
+            retrieval_need="none",
+            reasoning_summary="",
+            classification_source="llm",
+        )
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated_or_fallback",
+            return_value=_good_result,
+        ) as mock_fn:
+            classify_query("What is 2+2?")
+        mock_fn.assert_called_once_with("What is 2+2?", request_id=None)
+
+
+class TestClassifyWithLlmOrchestratedRequestId:
+    """_classify_with_llm_orchestrated must pass request_id into RouteRequest."""
+
+    def _fake_generate(self, captured: list):
+        import json
+        from types import SimpleNamespace
+
+        def _inner(route_request, query, classification, context):
+            captured.append(route_request)
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "intent": "solve_question",
+                        "subject": "math",
+                        "topic": "algebra",
+                        "response_style": "step_by_step",
+                        "confidence": 0.9,
+                        "retrieval_need": "none",
+                        "reasoning_summary": "",
+                    }
+                )
+            )
+
+        return _inner
+
+    def test_uses_provided_request_id(self):
+        captured: list = []
+        mock_orchestrator = MagicMock()
+        mock_orchestrator.generate.side_effect = self._fake_generate(captured)
+        with patch.object(
+            classifier_module, "_get_classifier_orchestrator", return_value=mock_orchestrator
+        ):
+            classifier_module._classify_with_llm_orchestrated("Solve x+1=3", request_id="trace-abc")
+        assert len(captured) == 1
+        assert captured[0].request_id == "trace-abc"
+
+    def test_generates_uuid_fallback_when_request_id_is_none(self):
+        import re
+
+        captured: list = []
+        mock_orchestrator = MagicMock()
+        mock_orchestrator.generate.side_effect = self._fake_generate(captured)
+        with patch.object(
+            classifier_module, "_get_classifier_orchestrator", return_value=mock_orchestrator
+        ):
+            classifier_module._classify_with_llm_orchestrated("Solve x+1=3", request_id=None)
+        assert len(captured) == 1
+        assert re.match(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            captured[0].request_id,
+        ), f"Expected UUID, got: {captured[0].request_id}"
+
+    def test_route_request_has_classifier_task_role(self):
+        captured: list = []
+        mock_orchestrator = MagicMock()
+        mock_orchestrator.generate.side_effect = self._fake_generate(captured)
+        with patch.object(
+            classifier_module, "_get_classifier_orchestrator", return_value=mock_orchestrator
+        ):
+            classifier_module._classify_with_llm_orchestrated("What is x?", request_id="r1")
+        assert captured[0].task_role == "classifier"
+        assert captured[0].subject == "general"
+        assert captured[0].difficulty == "default"
+
+
+# ---------------------------------------------------------------------------
+# Part F — validate_real_mode_deployments (Part B fix coverage)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateRealModeDeployments:
+    """validate_real_mode_deployments must raise LlmConfigValidationError for placeholder names.
+
+    NOTE: model_registry.yaml currently has real deployment names — no YOUR_* placeholders.
+    The tests that previously used the production registry to verify raises have been
+    updated to use an inline registry with known placeholder data.
+    The production registry test verifies validate_real_mode_deployments does NOT raise.
+    """
+
+    def _placeholder_registry(self):
+        """Return a registry object with a known YOUR_* placeholder deployment."""
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        registry = LlmConfigRegistry.__new__(LlmConfigRegistry)
+        mock_model = MagicMock()
+        mock_model.provider = "azure_openai"
+        mock_model.deployment = "YOUR_AZURE_GPT4O_DEPLOYMENT"
+        registry._model_map = {"math_basic_generator": mock_model}
+        return registry
+
+    def test_raises_for_placeholder_azure_deployments(self):
+        """Registry with YOUR_* deployment must raise LlmConfigValidationError."""
+        from services.llm.orchestration.errors import LlmConfigValidationError
+
+        registry = self._placeholder_registry()
+        with pytest.raises(LlmConfigValidationError) as exc_info:
+            registry.validate_real_mode_deployments()
+        assert "Placeholder" in str(exc_info.value)
+        assert "model_alias=" in str(exc_info.value)
+
+    def test_raises_includes_actionable_message(self):
+        """Error message must mention model_registry.yaml so developer knows where to look."""
+        from services.llm.orchestration.errors import LlmConfigValidationError
+
+        registry = self._placeholder_registry()
+        with pytest.raises(LlmConfigValidationError) as exc_info:
+            registry.validate_real_mode_deployments()
+        assert "model_registry.yaml" in str(exc_info.value)
+
+    def test_passes_when_no_placeholder_deployments(self):
+        """Registry with real deployment names must not raise."""
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        registry = LlmConfigRegistry.__new__(LlmConfigRegistry)
+        mock_model = MagicMock()
+        mock_model.provider = "azure_openai"
+        mock_model.deployment = "gpt-4o-mini-prod"
+        registry._model_map = {"prod_model": mock_model}
+        # Must not raise
+        registry.validate_real_mode_deployments()
+
+    def test_production_registry_passes_validation(self):
+        """Production model_registry.yaml has real deployment names — must not raise.
+
+        If this test fails, someone introduced a YOUR_* placeholder — replace it
+        with a real Azure deployment name in config/llm/model_registry.yaml.
+        """
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        registry = LlmConfigRegistry()
+        # Must not raise — all Azure deployments are real names
+        registry.validate_real_mode_deployments()
+
+    def test_error_does_not_contain_sensitive_info(self):
+        """[SECURITY] Error message must not expose keys, endpoints, or secrets."""
+        from services.llm.orchestration.errors import LlmConfigValidationError
+
+        registry = self._placeholder_registry()
+        with pytest.raises(LlmConfigValidationError) as exc_info:
+            registry.validate_real_mode_deployments()
+        msg = str(exc_info.value)
+        for forbidden in ("api_key", "AZURE_API_KEY", "endpoint", "http://", "https://", "secret"):
+            assert forbidden.lower() not in msg.lower(), (
+                f"Error message contains sensitive info '{forbidden}': {msg}"
+            )

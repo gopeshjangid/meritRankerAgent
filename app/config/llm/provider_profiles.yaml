@@ -1,0 +1,61 @@
+# app/config/llm/provider_profiles.yaml
+# ---------------------------------------------------------------------------
+# LLM Provider Profiles — Part 9.2 (Azure API mode support)
+# ---------------------------------------------------------------------------
+# IMPORTANT: This file contains NO secrets.
+# All values are environment variable NAMES only — never actual secret values.
+# The actual values are loaded at runtime from the process environment
+# or AWS Secrets Manager.
+#
+# Azure API modes
+# ---------------
+# azure_deployment_chat_completions (default):
+#   Classic Azure OpenAI deployment endpoint.
+#   endpoint_env must point to https://<resource>.openai.azure.com
+#   Must NOT end with /openai/v1.  api_version_env required.
+#   Adapter appends: /openai/deployments/<deployment>/chat/completions?api-version=...
+#
+# azure_openai_v1:
+#   OpenAI-compatible v1 API (Azure AI Foundry or OpenAI-compatible resource).
+#   base_url_env must point to a URL ending in /openai/v1 or /openai/v1/
+#   (e.g. https://<resource>.openai.azure.com/openai/v1).
+#   Adapter uses OpenAI(base_url=...) — NO deployment path is appended.
+#   Deployment name is passed as model= parameter.
+#   api_version NOT sent by our code at URL level.
+# ---------------------------------------------------------------------------
+
+version: 1
+
+provider_profiles:
+
+  openai_primary:
+    provider: openai
+    api_key_env: OPENAI_API_KEY
+    base_url_env: OPENAI_BASE_URL
+
+  # Classic Azure OpenAI deployment endpoint.
+  # Use when AZURE_OPENAI_ENDPOINT = https://<resource>.openai.azure.com
+  # (does NOT end with /openai/v1).
+  azure_primary:
+    provider: azure_openai
+    azure_api_mode: azure_deployment_chat_completions
+    endpoint_env: AZURE_OPENAI_ENDPOINT
+    api_key_env: AZURE_OPENAI_API_KEY
+    api_version_env: AZURE_OPENAI_API_VERSION
+
+  # OpenAI-compatible v1 API endpoint.
+  # Use when AZURE_OPENAI_ENDPOINT ends with /openai/v1
+  # (e.g. https://<resource>.openai.azure.com/openai/v1).
+  # Set AZURE_OPENAI_ENDPOINT in .env.local to the full /openai/v1 URL.
+  azure_foundry_v1:
+    provider: azure_openai
+    azure_api_mode: azure_openai_v1
+    endpoint_env: AZURE_OPENAI_ENDPOINT
+    api_key_env: AZURE_OPENAI_API_KEY
+
+  gemini_primary:
+    provider: gemini
+    api_key_env: GEMINI_API_KEY
+
+  local_mock:
+    provider: mock

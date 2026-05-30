@@ -1,0 +1,174 @@
+# app/config/llm/model_registry.yaml
+# ---------------------------------------------------------------------------
+# LLM Model Registry — Part 9.2 (Azure-first, azure_openai_v1 endpoint mode)
+# ---------------------------------------------------------------------------
+# IMPORTANT: This file contains NO secrets.
+# Provider profiles contain only environment variable NAMES (never actual values).
+# Model aliases are capability-readable (e.g. math_basic_generator) — they are
+# NOT coupled to a specific provider or model name.
+#
+# Provider strategy:
+#   Primary aliases → Azure OpenAI first (GPT/OpenAI-family models).
+#                     Uses azure_foundry_v1 profile (OpenAI-compatible /openai/v1 base URL).
+#   Fallback aliases → Native OpenAI (suffixed _openai_native).
+#   Other providers can be added as additional fallback aliases later.
+#
+# Azure API mode (azure_foundry_v1 profile):
+#   AZURE_OPENAI_ENDPOINT must end with /openai/v1
+#   (e.g. https://<resource>.openai.azure.com/openai/v1).
+#   The deployment field is passed as model= — no /openai/deployments/... path.
+#
+# Fallback aliases (e.g. math_basic_generator_openai_native) are referenced
+# only in fallback_models — never in llm_routes.yaml.
+# ---------------------------------------------------------------------------
+
+version: 1
+
+models:
+
+  # -------------------------------------------------------------------------
+  # Primary aliases — Azure-first
+  # -------------------------------------------------------------------------
+
+  math_basic_generator:
+    description: Azure-first basic math generator. Falls back to native OpenAI.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+    fallback_models:
+      - math_basic_generator_openai_native
+
+  math_reasoning_generator:
+    description: Azure-first reasoning model for advanced math and multi-step problems.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1
+    supports_streaming: true
+    supports_thinking: true
+    timeout_seconds: 40
+    fallback_models:
+      - math_reasoning_generator_openai_native
+
+  reasoning_standard_generator:
+    description: Azure-first standard reasoning generator. Falls back to native OpenAI.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+    fallback_models:
+      - reasoning_standard_generator_openai_native
+
+  english_fast_generator:
+    description: Azure-first fast English explanation generator. Falls back to native OpenAI.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+    fallback_models:
+      - english_fast_generator_openai_native
+
+  general_fast_generator:
+    description: Azure-first general-purpose explanation generator. Falls back to native OpenAI.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+    fallback_models:
+      - general_fast_generator_openai_native
+
+  # -------------------------------------------------------------------------
+  # Fallback aliases — native OpenAI
+  # These are NOT referenced in llm_routes.yaml.
+  # They exist only as fallback_models targets.
+  # -------------------------------------------------------------------------
+
+  math_basic_generator_openai_native:
+    description: Native OpenAI fallback for basic math generator.
+    provider: openai
+    provider_profile: openai_primary
+    model_id: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 20
+
+  math_reasoning_generator_openai_native:
+    description: Native OpenAI fallback for reasoning model (thinking not supported natively).
+    provider: openai
+    provider_profile: openai_primary
+    model_id: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+
+  reasoning_standard_generator_openai_native:
+    description: Native OpenAI fallback for standard reasoning generator.
+    provider: openai
+    provider_profile: openai_primary
+    model_id: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 20
+
+  english_fast_generator_openai_native:
+    description: Native OpenAI fallback for fast English explanation generator.
+    provider: openai
+    provider_profile: openai_primary
+    model_id: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 20
+
+  general_fast_generator_openai_native:
+    description: Native OpenAI fallback for general-purpose generator.
+    provider: openai
+    provider_profile: openai_primary
+    model_id: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 20
+
+  # -------------------------------------------------------------------------
+  # Classifier models — Azure-first, native OpenAI fallback
+  # -------------------------------------------------------------------------
+
+  doubt_solver_classifier:
+    description: Azure-first classifier for doubt solver query classification.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1
+    supports_streaming: false
+    supports_thinking: false
+    timeout_seconds: 20
+    fallback_models:
+      - doubt_solver_classifier_openai_native
+
+  doubt_solver_classifier_openai_native:
+    description: Native OpenAI fallback for doubt solver classifier.
+    provider: openai
+    provider_profile: openai_primary
+    model_id: gpt-4.1-mini
+    supports_streaming: false
+    supports_thinking: false
+    timeout_seconds: 15
+
+  # -------------------------------------------------------------------------
+  # Safe mock — always present for the nuclear fallback / dry-run path
+  # -------------------------------------------------------------------------
+
+  safe_mock:
+    description: Local deterministic mock model for tests, dry-runs, and fallback.
+    provider: mock
+    provider_profile: local_mock
+    model_id: local-mock
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 1

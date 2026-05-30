@@ -1,0 +1,202 @@
+# app/config/llm/llm_routes.yaml
+# ---------------------------------------------------------------------------
+# LLM Routing Table — Part 7.1 (split from llm_orchestration.yaml)
+# ---------------------------------------------------------------------------
+# IMPORTANT: This file contains NO secrets and NO provider details.
+# Routes reference model ALIASES only (capability-readable names like
+# "math_basic_generator").  Provider details live in model_registry.yaml.
+# ---------------------------------------------------------------------------
+
+version: 1
+
+routes:
+  # -------------------------------------------------------------------------
+  # Generator routes
+  # -------------------------------------------------------------------------
+  math:
+    generator:
+      default:
+        model: math_basic_generator
+        prompt: subjects/math_generator.md
+        temperature: 0.2
+        max_tokens: 800
+        intent_overlays:
+          solve:
+            - intents/solve.md
+          explain:
+            - intents/explain.md
+          practice:
+            - intents/practice.md
+          visualize:
+            - intents/visualize.md
+        fallback:
+          - general_default
+          - safe_mock
+
+      basic:
+        inherits: default
+        overlays:
+          - levels/basic.md
+        max_tokens: 800
+        fallback:
+          - default
+          - general_default
+          - safe_mock
+
+      intermediate:
+        inherits: default
+        overlays:
+          - levels/intermediate.md
+        max_tokens: 900
+        fallback:
+          - basic
+          - default
+          - general_default
+          - safe_mock
+
+      advanced:
+        inherits: default
+        model: math_reasoning_generator
+        overlays:
+          - levels/advanced.md
+        temperature: 0.15
+        max_tokens: 1200
+        provider_options:
+          thinking: true
+        fallback:
+          - intermediate
+          - default
+          - general_default
+          - safe_mock
+
+  reasoning:
+    generator:
+      default:
+        model: reasoning_standard_generator
+        prompt: subjects/reasoning_generator.md
+        temperature: 0.2
+        max_tokens: 900
+        intent_overlays:
+          solve:
+            - intents/solve.md
+          explain:
+            - intents/explain.md
+          practice:
+            - intents/practice.md
+          visualize:
+            - intents/visualize.md
+        fallback:
+          - general_default
+          - safe_mock
+
+      basic:
+        inherits: default
+        overlays:
+          - levels/basic.md
+        max_tokens: 800
+        fallback:
+          - default
+          - general_default
+          - safe_mock
+
+      intermediate:
+        inherits: default
+        overlays:
+          - levels/intermediate.md
+        max_tokens: 900
+        fallback:
+          - basic
+          - default
+          - general_default
+          - safe_mock
+
+      advanced:
+        inherits: default
+        overlays:
+          - levels/advanced.md
+        max_tokens: 1000
+        fallback:
+          - intermediate
+          - default
+          - general_default
+          - safe_mock
+
+  english:
+    generator:
+      default:
+        model: english_fast_generator
+        prompt: subjects/english_generator.md
+        temperature: 0.3
+        max_tokens: 800
+        intent_overlays:
+          solve:
+            - intents/solve.md
+          explain:
+            - intents/explain.md
+          practice:
+            - intents/practice.md
+          visualize:
+            - intents/visualize.md
+        fallback:
+          - general_default
+          - safe_mock
+
+      basic:
+        inherits: default
+        overlays:
+          - levels/basic.md
+        max_tokens: 700
+        fallback:
+          - default
+          - general_default
+          - safe_mock
+
+      intermediate:
+        inherits: default
+        overlays:
+          - levels/intermediate.md
+        max_tokens: 800
+        fallback:
+          - basic
+          - default
+          - general_default
+          - safe_mock
+
+      advanced:
+        inherits: default
+        overlays:
+          - levels/advanced.md
+        max_tokens: 900
+        fallback:
+          - intermediate
+          - default
+          - general_default
+          - safe_mock
+
+  general:
+    classifier:
+      default:
+        model: doubt_solver_classifier
+        prompt: query_classifier.md
+        temperature: 0.1
+        max_tokens: 500
+        fallback:
+          - safe_mock
+
+    generator:
+      default:
+        model: general_fast_generator
+        prompt: subjects/general_generator.md
+        temperature: 0.3
+        max_tokens: 800
+        intent_overlays:
+          solve:
+            - intents/solve.md
+          explain:
+            - intents/explain.md
+          practice:
+            - intents/practice.md
+          visualize:
+            - intents/visualize.md
+        fallback:
+          - safe_mock

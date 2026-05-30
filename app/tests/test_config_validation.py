@@ -1,0 +1,353 @@
+"""
+app/tests/test_config_validation.py
+--------------------------------------
+Tests for configuration validation behaviour.
+
+Verifies that:
+    - ENABLE_REAL_LLM=true with missing role config → LlmConfigurationError
+    - ENABLE_KB_RETRIEVAL=true with missing BEDROCK_KB_ID → KnowledgeBaseConfigurationError
+    - ENABLE_DYNAMODB_FETCH=true with missing table name → DynamoDbConfigurationError
+    - Malformed LLM_ROLE_CONFIG_JSON → LlmConfigurationError
+    - Graph handles config errors gracefully (does not crash; sets needs_review=True)
+    - Default (all flags off) produces no config errors
+
+No real AWS credentials, network, or LLM calls required.
+All config errors are triggered through env var manipulation and service calls.
+
+Observation:
+    Invalid integer values for BEDROCK_KB_MAX_RESULTS or
+    DOUBT_SOLVER_MAX_CONTEXT_CHARS will raise ValueError from int() at settings
+    load time.  This is a clear "fail-fast" error — the agent refuses to start
+    with a misconfigured environment.  No silent fallback is provided by design.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+import config as cfg_module
+
+
+def _reset_settings() -> None:
+    cfg_module._settings = None
+
+
+# ---------------------------------------------------------------------------
+# LLM configuration errors
+# ---------------------------------------------------------------------------
+
+
+class TestLlmConfigValidation:
+    """ENABLE_REAL_LLM=true with various config problems → LlmConfigurationError."""
+
+    def test_real_llm_enabled_missing_role_config_raises(self, monkeypatch):
+        """ENABLE_REAL_LLM=true but LLM_ROLE_CONFIG_JSON is empty → error."""
+        from services.llm_providers.errors import LlmConfigurationError  # noqa: PLC0415
+
+        monkeypatch.setenv("ENABLE_REAL_LLM", "true")
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", "{}")
+        _reset_settings()
+
+        with pytest.raises(LlmConfigurationError, match="no role config found"):
+            cfg_module.get_llm_role_config("doubt_solver_classifier")
+
+    def test_real_llm_disabled_missing_role_returns_mock(self, monkeypatch):
+        """ENABLE_REAL_LLM=false → missing role config falls back to mock."""
+        monkeypatch.setenv("ENABLE_REAL_LLM", "false")
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", "{}")
+        _reset_settings()
+
+        role_config = cfg_module.get_llm_role_config("doubt_solver_classifier")
+        assert role_config.provider == "mock"
+
+    def test_malformed_role_config_json_raises(self, monkeypatch):
+        """LLM_ROLE_CONFIG_JSON that is not valid JSON → LlmConfigurationError."""
+        from services.llm_providers.errors import LlmConfigurationError  # noqa: PLC0415
+
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", "{not valid json}")
+        _reset_settings()
+
+        with pytest.raises(LlmConfigurationError, match="not valid JSON"):
+            cfg_module.get_llm_role_config("doubt_solver_classifier")
+
+    def test_malformed_json_with_real_llm_raises(self, monkeypatch):
+        """Malformed JSON raises even when ENABLE_REAL_LLM=false."""
+        from services.llm_providers.errors import LlmConfigurationError  # noqa: PLC0415
+
+        monkeypatch.setenv("ENABLE_REAL_LLM", "false")
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", "this is not json at all")
+        _reset_settings()
+
+        with pytest.raises(LlmConfigurationError):
+            cfg_module.get_llm_role_config("doubt_solver_classifier")
+
+    def test_valid_role_config_parses_correctly(self, monkeypatch):
+        """Well-formed LLM_ROLE_CONFIG_JSON with the target role → no error."""
+        import json  # noqa: PLC0415
+
+        config_map = {
+            "doubt_solver_classifier": {
+                "provider": "azure_openai",
+                "model_label": "gpt-4-mini",
+                "deployment": "my-deployment",
+                "temperature": 0.0,
+                "max_tokens": 500,
+                "supports_streaming": False,
+            }
+        }
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", json.dumps(config_map))
+        _reset_settings()
+
+        role_config = cfg_module.get_llm_role_config("doubt_solver_classifier")
+        assert role_config.provider == "azure_openai"
+        assert role_config.model_label == "gpt-4-mini"
+
+    def test_real_llm_enabled_with_valid_config_no_error(self, monkeypatch):
+        """ENABLE_REAL_LLM=true + valid config → no LlmConfigurationError."""
+        import json  # noqa: PLC0415
+
+        config_map = {
+            "doubt_solver_generator": {
+                "provider": "openai",
+                "model_label": "gpt-4o",
+                "temperature": 0.2,
+                "max_tokens": 1200,
+                "supports_streaming": False,
+            }
+        }
+        monkeypatch.setenv("ENABLE_REAL_LLM", "true")
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", json.dumps(config_map))
+        _reset_settings()
+
+        role_config = cfg_module.get_llm_role_config("doubt_solver_generator")
+        assert role_config.provider == "openai"
+
+
+# ---------------------------------------------------------------------------
+# KB configuration errors
+# ---------------------------------------------------------------------------
+
+
+class TestKbConfigValidation:
+    """ENABLE_KB_RETRIEVAL=true with missing KB ID → KnowledgeBaseConfigurationError."""
+
+    def test_kb_enabled_missing_kb_id_raises(self, monkeypatch):
+        """ENABLE_KB_RETRIEVAL=true + BEDROCK_KB_ID='' → KnowledgeBaseConfigurationError."""
+        from services.bedrock_kb_service import (  # noqa: PLC0415
+            KnowledgeBaseConfigurationError,
+            retrieve_similar_context,
+        )
+
+        monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "true")
+        monkeypatch.setenv("BEDROCK_KB_ID", "")
+        _reset_settings()
+
+        with pytest.raises(KnowledgeBaseConfigurationError, match="BEDROCK_KB_ID"):
+            retrieve_similar_context("What is ratio?")
+
+    def test_kb_disabled_missing_kb_id_no_error(self, monkeypatch):
+        """ENABLE_KB_RETRIEVAL=false → missing KB ID is fine, returns disabled."""
+        from services.bedrock_kb_service import retrieve_similar_context  # noqa: PLC0415
+
+        monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "false")
+        monkeypatch.setenv("BEDROCK_KB_ID", "")
+        _reset_settings()
+
+        result = retrieve_similar_context("What is ratio?")
+        assert result.retrieval_source == "disabled"
+        assert result.results == []
+
+    def test_kb_config_error_caught_by_graph(self, monkeypatch):
+        """Graph handles KnowledgeBaseConfigurationError gracefully → needs_review=True."""
+        import graphs.doubt_solver_graph as graph_module  # noqa: PLC0415
+        from services.bedrock_kb_service import (  # noqa: PLC0415
+            KnowledgeBaseConfigurationError,
+        )
+
+        monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "true")
+        monkeypatch.setenv("BEDROCK_KB_ID", "fake-id")
+        _reset_settings()
+
+        def _config_error(query, max_results=None):
+            raise KnowledgeBaseConfigurationError("Missing KB ID (graph-level test)")
+
+        monkeypatch.setattr(graph_module, "retrieve_similar_context", _config_error)
+
+        from graphs.doubt_solver_graph import build_doubt_solver_graph  # noqa: PLC0415
+
+        result = build_doubt_solver_graph().invoke(
+            {
+                "request_id": "cfg-test",
+                "query": "Explain percentage",
+                "user_id": "test",
+                "mode": "doubt_solver",
+                "language": "en",
+                "classification": None,
+                "answer": None,
+                "answer_source": None,
+                "is_truncated": False,
+                "response": None,
+                "should_retrieve": False,
+                "kb_results": None,
+                "dynamodb_records": None,
+                "answer_context": None,
+                "context_source_count": 0,
+                "used_retrieval": False,
+                "context_used": False,
+                "service_error": False,
+            }
+        )
+
+        assert result["response"]["success"] is True
+        assert result["response"]["needs_review"] is True
+
+
+# ---------------------------------------------------------------------------
+# DynamoDB configuration errors
+# ---------------------------------------------------------------------------
+
+
+class TestDynamoDbConfigValidation:
+    """ENABLE_DYNAMODB_FETCH=true with missing table → DynamoDbConfigurationError."""
+
+    def test_dynamodb_enabled_missing_question_table_raises(self, monkeypatch):
+        """ENABLE_DYNAMODB_FETCH=true + DYNAMODB_QUESTION_TABLE='' → error."""
+        from services.dynamodb_service import DynamoDbConfigurationError  # noqa: PLC0415
+        from services.question_record_service import (  # noqa: PLC0415
+            fetch_question_record_by_id,
+        )
+
+        monkeypatch.setenv("ENABLE_DYNAMODB_FETCH", "true")
+        monkeypatch.setenv("DYNAMODB_QUESTION_TABLE", "")
+        _reset_settings()
+
+        with pytest.raises(DynamoDbConfigurationError, match="DYNAMODB_QUESTION_TABLE"):
+            fetch_question_record_by_id("q-1")
+
+    def test_dynamodb_disabled_missing_table_no_error(self, monkeypatch):
+        """ENABLE_DYNAMODB_FETCH=false → missing table is fine, returns None."""
+        from services.question_record_service import (  # noqa: PLC0415
+            fetch_question_record_by_id,
+        )
+
+        monkeypatch.setenv("ENABLE_DYNAMODB_FETCH", "false")
+        monkeypatch.setenv("DYNAMODB_QUESTION_TABLE", "")
+        _reset_settings()
+
+        result = fetch_question_record_by_id("q-1")
+        assert result is None
+
+    def test_dynamodb_config_error_caught_by_graph(self, monkeypatch):
+        """Graph handles DynamoDbConfigurationError gracefully → needs_review=True."""
+        import graphs.doubt_solver_graph as graph_module  # noqa: PLC0415
+        from schemas.retrieval import KnowledgeBaseResult, RetrievalResponse  # noqa: PLC0415
+        from services.dynamodb_service import DynamoDbConfigurationError  # noqa: PLC0415
+
+        monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "true")
+        monkeypatch.setenv("BEDROCK_KB_ID", "fake-id")
+        monkeypatch.setenv("ENABLE_DYNAMODB_FETCH", "true")
+        monkeypatch.setenv("DYNAMODB_QUESTION_TABLE", "")
+        _reset_settings()
+
+        def _fake_kb(query, max_results=None):
+            return RetrievalResponse(
+                query=query,
+                results=[KnowledgeBaseResult(content="c.", record_ids=["q-1"])],
+                result_count=1,
+                retrieval_source="bedrock_kb",
+            )
+
+        def _config_err_fetch(ids):
+            raise DynamoDbConfigurationError("Missing table (graph-level test)")
+
+        monkeypatch.setattr(graph_module, "retrieve_similar_context", _fake_kb)
+        monkeypatch.setattr(graph_module, "fetch_question_records_by_ids", _config_err_fetch)
+
+        from graphs.doubt_solver_graph import build_doubt_solver_graph  # noqa: PLC0415
+
+        result = build_doubt_solver_graph().invoke(
+            {
+                "request_id": "cfg-dynamo-test",
+                "query": "Explain algebra",
+                "user_id": "test",
+                "mode": "doubt_solver",
+                "language": "en",
+                "classification": None,
+                "answer": None,
+                "answer_source": None,
+                "is_truncated": False,
+                "response": None,
+                "should_retrieve": False,
+                "kb_results": None,
+                "dynamodb_records": None,
+                "answer_context": None,
+                "context_source_count": 0,
+                "used_retrieval": False,
+                "context_used": False,
+                "service_error": False,
+            }
+        )
+
+        assert result["response"]["success"] is True
+        assert result["response"]["needs_review"] is True
+
+
+# ---------------------------------------------------------------------------
+# Default settings produce no errors
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultConfigNoErrors:
+    """With all flags at their defaults (off), no config errors occur."""
+
+    def test_default_settings_no_llm_error(self, monkeypatch):
+        """ENABLE_REAL_LLM defaults to false → get_llm_role_config() returns mock."""
+        monkeypatch.setenv("ENABLE_REAL_LLM", "false")
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", "{}")
+        _reset_settings()
+
+        config = cfg_module.get_llm_role_config("any_role")
+        assert config.provider == "mock"
+
+    def test_default_settings_no_kb_error(self, monkeypatch):
+        """ENABLE_KB_RETRIEVAL defaults to false → retrieve returns disabled."""
+        from services.bedrock_kb_service import retrieve_similar_context  # noqa: PLC0415
+
+        monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "false")
+        _reset_settings()
+
+        result = retrieve_similar_context("test query")
+        assert result.retrieval_source == "disabled"
+
+    def test_default_settings_no_dynamodb_error(self, monkeypatch):
+        """ENABLE_DYNAMODB_FETCH defaults to false → fetch_question_records returns []."""
+        from services.question_record_service import (  # noqa: PLC0415
+            fetch_question_records_by_ids,
+        )
+
+        monkeypatch.setenv("ENABLE_DYNAMODB_FETCH", "false")
+        _reset_settings()
+
+        result = fetch_question_records_by_ids(["q-1", "q-2"])
+        assert result == []
+
+    def test_default_context_chars_is_positive_integer(self, monkeypatch):
+        """DOUBT_SOLVER_MAX_CONTEXT_CHARS defaults to 6000."""
+        monkeypatch.delenv("DOUBT_SOLVER_MAX_CONTEXT_CHARS", raising=False)
+        _reset_settings()
+
+        settings = cfg_module.get_settings()
+        assert settings.doubt_solver_max_context_chars == 6000
+        assert settings.doubt_solver_max_context_chars > 0
+
+    def test_invalid_integer_env_var_raises_value_error(self, monkeypatch):
+        """A non-integer value for DOUBT_SOLVER_MAX_CONTEXT_CHARS raises ValueError.
+
+        This is a fast-fail behaviour by design: the agent refuses to start
+        with a misconfigured environment rather than silently using a wrong value.
+        """
+        monkeypatch.setenv("DOUBT_SOLVER_MAX_CONTEXT_CHARS", "not-a-number")
+        _reset_settings()
+
+        with pytest.raises(ValueError):
+            cfg_module.get_settings()

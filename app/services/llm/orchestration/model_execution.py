@@ -1,0 +1,467 @@
+"""
+app/services/llm_orchestration/model_execution.py
+-------------------------------------------------
+Model execution boundary backed by the LLM config registry.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from schemas.llm import LlmMessage
+from schemas.llm_orchestration import (
+    ModelExecutionResult,
+    ProviderExecutionRequest,
+)
+from schemas.llm_routing import RouteDecision
+from services.llm.orchestration.errors import ProviderExecutionError
+from services.llm.orchestration.model_config_resolver import ModelConfigResolver
+from services.llm.providers.errors import (
+    FALLBACK_ELIGIBLE_FAILURE_KINDS,
+    LlmProviderExecutionError,
+)
+
+if TYPE_CHECKING:
+    from services.llm.providers.provider_factory import ProviderAdapterFactory
+    from services.secrets.provider_credentials import ProviderCredentialResolver
+
+logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class ProviderExecutor(Protocol):
+    """Boundary for provider adapters used by RegistryBackedModelExecutor."""
+
+    def execute(self, request: ProviderExecutionRequest) -> ModelExecutionResult:
+        """Execute a provider request and return a normalized result."""
+        ...
+
+    def execute_stream(self, request: ProviderExecutionRequest) -> Iterator[str]:
+        """Execute a provider request and yield answer text chunks."""
+        ...
+
+
+class FakeProviderExecutor:
+    """Test-only ProviderExecutor that records the last request."""
+
+    def __init__(
+        self,
+        *,
+        content: str = "Fake provider response.",
+        raise_on_execute: Exception | None = None,
+        finish_reason: str | None = "stop",
+    ) -> None:
+        self._content = content
+        self._raise_on_execute = raise_on_execute
+        self._finish_reason = finish_reason
+        self.last_request: ProviderExecutionRequest | None = None
+        self.call_count: int = 0
+
+    def execute(self, request: ProviderExecutionRequest) -> ModelExecutionResult:
+        self.last_request = request
+        self.call_count += 1
+
+        if self._raise_on_execute is not None:
+            raise self._raise_on_execute
+
+        return ModelExecutionResult(
+            content=self._content,
+            model=request.model_resolution.model_alias,
+            provider=request.model_resolution.provider,
+            finish_reason=self._finish_reason,
+            metadata=request.model_resolution.safe_metadata,
+        )
+
+    def execute_stream(self, request: ProviderExecutionRequest) -> Iterator[str]:
+        self.last_request = request
+        self.call_count += 1
+
+        if self._raise_on_execute is not None:
+            raise self._raise_on_execute
+
+        chunk_size = 8
+        for i in range(0, len(self._content), chunk_size):
+            yield self._content[i : i + chunk_size]
+
+
+class RegistryBackedModelExecutor:
+    """Resolve model metadata and delegate execution to an injected provider."""
+
+    def __init__(
+        self,
+        *,
+        provider_executor: ProviderExecutor,
+        model_config_resolver: ModelConfigResolver | None = None,
+    ) -> None:
+        if provider_executor is None:
+            raise TypeError("provider_executor is required.")
+        self._provider_executor = provider_executor
+        self._model_config_resolver = (
+            model_config_resolver
+            if model_config_resolver is not None
+            else ModelConfigResolver()
+        )
+
+    def execute(
+        self,
+        *,
+        route_decision: RouteDecision,
+        messages: list[LlmMessage],
+    ) -> ModelExecutionResult:
+        primary_alias = route_decision.model
+        model_resolution = self._model_config_resolver.resolve(route_decision)
+        self._model_config_resolver.validate_provider_options(
+            provider_options=route_decision.provider_options,
+            model_config=model_resolution.model_config,
+            model_alias=model_resolution.model_alias,
+        )
+        primary_request = ProviderExecutionRequest(
+            route_decision=route_decision,
+            model_resolution=model_resolution,
+            messages=messages,
+            temperature=route_decision.temperature,
+            max_tokens=route_decision.max_tokens,
+            provider_options=dict(route_decision.provider_options),
+        )
+
+        logger.info(
+            "registry_backed_model_executor.execute  model_alias=%s  provider=%s  "
+            "supports_streaming=%s  supports_thinking=%s  timeout_seconds=%d",
+            model_resolution.safe_metadata["model_alias"],
+            model_resolution.safe_metadata["provider"],
+            model_resolution.safe_metadata["supports_streaming"],
+            model_resolution.safe_metadata["supports_thinking"],
+            model_resolution.safe_metadata["timeout_seconds"],
+        )
+
+        # --- Try primary model ---
+        primary_failure_kind: str | None = None
+        try:
+            return self._provider_executor.execute(primary_request)
+        except LlmProviderExecutionError as exc:
+            if exc.failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
+                # Not a retryable provider failure — wrap and raise immediately.
+                raise ProviderExecutionError(
+                    f"Provider execution failed for model '{primary_alias}' "
+                    f"(failure_kind={exc.failure_kind!r}): {type(exc).__name__}"
+                ) from exc
+            primary_failure_kind = exc.failure_kind
+            logger.warning(
+                "registry_backed_model_executor.execute  primary_failed  "
+                "model_alias=%s  failure_kind=%s — attempting fallback",
+                primary_alias,
+                primary_failure_kind,
+            )
+        except ProviderExecutionError:
+            raise
+        except Exception as exc:
+            raise ProviderExecutionError(
+                f"Provider executor failed for model '{primary_alias}': "
+                f"{type(exc).__name__}"
+            ) from exc
+
+        # --- Fallback loop ---
+        fallback_aliases: list[str] = list(
+            getattr(model_resolution.model_config, "fallback_models", None) or []
+        )
+        attempted: list[str] = [primary_alias]
+
+        for fallback_alias in fallback_aliases:
+            try:
+                fallback_resolution = self._model_config_resolver.resolve_for_alias(
+                    fallback_alias
+                )
+            except Exception as cfg_exc:
+                logger.warning(
+                    "registry_backed_model_executor.execute  fallback_config_error  "
+                    "fallback_alias=%s  error=%s — skipping",
+                    fallback_alias,
+                    type(cfg_exc).__name__,
+                )
+                attempted.append(fallback_alias)
+                continue
+
+            fallback_request = ProviderExecutionRequest(
+                route_decision=route_decision,
+                model_resolution=fallback_resolution,
+                messages=messages,  # same messages — reused safely
+                temperature=route_decision.temperature,
+                max_tokens=route_decision.max_tokens,
+                provider_options={},  # strip thinking/stream options for fallback
+            )
+
+            logger.info(
+                "registry_backed_model_executor.execute  trying_fallback  "
+                "fallback_alias=%s  provider=%s",
+                fallback_alias,
+                fallback_resolution.provider,
+            )
+
+            try:
+                raw_result = self._provider_executor.execute(fallback_request)
+                # Build a new result that records the fallback provenance safely.
+                result = ModelExecutionResult(
+                    content=raw_result.content,
+                    model=fallback_alias,
+                    provider=raw_result.provider,
+                    finish_reason=raw_result.finish_reason,
+                    input_tokens=raw_result.input_tokens,
+                    output_tokens=raw_result.output_tokens,
+                    fallback_used=True,
+                    metadata={
+                        **{k: v for k, v in raw_result.metadata.items()},
+                        "fallback_from": primary_alias,
+                        "fallback_to": fallback_alias,
+                        "failure_kind": primary_failure_kind,
+                    },
+                )
+                logger.info(
+                    "registry_backed_model_executor.execute  fallback_succeeded  "
+                    "fallback_alias=%s  provider=%s  failure_kind=%s",
+                    fallback_alias,
+                    raw_result.provider,
+                    primary_failure_kind,
+                )
+                return result
+            except LlmProviderExecutionError as exc:
+                attempted.append(fallback_alias)
+                logger.warning(
+                    "registry_backed_model_executor.execute  fallback_failed  "
+                    "fallback_alias=%s  failure_kind=%s",
+                    fallback_alias,
+                    exc.failure_kind,
+                )
+            except Exception as exc:
+                attempted.append(fallback_alias)
+                logger.warning(
+                    "registry_backed_model_executor.execute  fallback_error  "
+                    "fallback_alias=%s  error=%s",
+                    fallback_alias,
+                    type(exc).__name__,
+                )
+
+        # All attempts exhausted.
+        raise ProviderExecutionError(
+            f"All model execution attempts failed. "
+            f"Attempted aliases: {attempted}. "
+            f"Primary failure_kind: {primary_failure_kind!r}."
+        )
+
+    def execute_stream(
+        self,
+        *,
+        route_decision: RouteDecision,
+        messages: list[LlmMessage],
+    ) -> Iterator[str]:
+        """Resolve model metadata and stream answer text chunks from the provider."""
+        primary_alias = route_decision.model
+        model_resolution = self._model_config_resolver.resolve(route_decision)
+        self._model_config_resolver.validate_provider_options(
+            provider_options=route_decision.provider_options,
+            model_config=model_resolution.model_config,
+            model_alias=model_resolution.model_alias,
+        )
+        primary_request = ProviderExecutionRequest(
+            route_decision=route_decision,
+            model_resolution=model_resolution,
+            messages=messages,
+            temperature=route_decision.temperature,
+            max_tokens=route_decision.max_tokens,
+            provider_options=dict(route_decision.provider_options),
+        )
+
+        logger.info(
+            "registry_backed_model_executor.execute_stream  model_alias=%s  provider=%s",
+            model_resolution.safe_metadata["model_alias"],
+            model_resolution.safe_metadata["provider"],
+        )
+
+        primary_failure_kind: str | None = None
+        try:
+            yield from self._provider_executor.execute_stream(primary_request)
+            return
+        except LlmProviderExecutionError as exc:
+            if exc.failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
+                raise ProviderExecutionError(
+                    f"Provider stream failed for model '{primary_alias}' "
+                    f"(failure_kind={exc.failure_kind!r}): {type(exc).__name__}"
+                ) from exc
+            primary_failure_kind = exc.failure_kind
+            logger.warning(
+                "registry_backed_model_executor.execute_stream  primary_failed  "
+                "model_alias=%s  failure_kind=%s — attempting fallback",
+                primary_alias,
+                primary_failure_kind,
+            )
+        except ProviderExecutionError:
+            raise
+        except Exception as exc:
+            raise ProviderExecutionError(
+                f"Provider executor stream failed for model '{primary_alias}': "
+                f"{type(exc).__name__}"
+            ) from exc
+
+        fallback_aliases: list[str] = list(
+            getattr(model_resolution.model_config, "fallback_models", None) or []
+        )
+        attempted: list[str] = [primary_alias]
+
+        for fallback_alias in fallback_aliases:
+            try:
+                fallback_resolution = self._model_config_resolver.resolve_for_alias(
+                    fallback_alias
+                )
+            except Exception as cfg_exc:
+                logger.warning(
+                    "registry_backed_model_executor.execute_stream  fallback_config_error  "
+                    "fallback_alias=%s  error=%s — skipping",
+                    fallback_alias,
+                    type(cfg_exc).__name__,
+                )
+                attempted.append(fallback_alias)
+                continue
+
+            fallback_request = ProviderExecutionRequest(
+                route_decision=route_decision,
+                model_resolution=fallback_resolution,
+                messages=messages,
+                temperature=route_decision.temperature,
+                max_tokens=route_decision.max_tokens,
+                provider_options={},
+            )
+            attempted.append(fallback_alias)
+
+            logger.info(
+                "registry_backed_model_executor.execute_stream  trying_fallback  "
+                "fallback_alias=%s  provider=%s",
+                fallback_alias,
+                fallback_resolution.provider,
+            )
+
+            try:
+                if hasattr(self._provider_executor, "execute_stream"):
+                    yield from self._provider_executor.execute_stream(fallback_request)
+                else:
+                    result = self._provider_executor.execute(fallback_request)
+                    yield result.content
+                logger.info(
+                    "registry_backed_model_executor.execute_stream  fallback_succeeded  "
+                    "fallback_alias=%s  provider=%s  failure_kind=%s",
+                    fallback_alias,
+                    fallback_resolution.provider,
+                    primary_failure_kind,
+                )
+                return
+            except LlmProviderExecutionError as exc:
+                logger.warning(
+                    "registry_backed_model_executor.execute_stream  fallback_failed  "
+                    "fallback_alias=%s  failure_kind=%s",
+                    fallback_alias,
+                    exc.failure_kind,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "registry_backed_model_executor.execute_stream  fallback_error  "
+                    "fallback_alias=%s  error=%s",
+                    fallback_alias,
+                    type(exc).__name__,
+                )
+
+        raise ProviderExecutionError(
+            f"All model stream attempts failed. "
+            f"Attempted aliases: {attempted}. "
+            f"Primary failure_kind: {primary_failure_kind!r}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Part 6: ProviderAdapterExecutor
+# ---------------------------------------------------------------------------
+
+
+class ProviderAdapterExecutor:
+    """Part 6 bridge that implements the ProviderExecutor protocol using the
+    ProviderAdapterFactory and ProviderCredentialResolver.
+
+    Flow:
+        1. Resolve ProviderCredentials via credential_resolver.resolve(profile).
+        2. Obtain the matching ProviderAdapter via provider_factory.get_provider(provider).
+        3. Call adapter.generate(request=request, credentials=credentials).
+
+    Error propagation:
+        - SecretResolverError subclasses propagate unchanged (credential resolution failed).
+        - LlmProviderAdapterError subclasses propagate unchanged (adapter failed).
+        - No exceptions are swallowed or wrapped by this executor.
+
+    No fallback logic. No graph dependency. No AWS calls.
+    """
+
+    def __init__(
+        self,
+        *,
+        credential_resolver: ProviderCredentialResolver,
+        provider_factory: ProviderAdapterFactory,
+    ) -> None:
+        """
+        Args:
+            credential_resolver: Resolves ProviderProfile env var references to
+                                  ProviderCredentials.  Required.
+            provider_factory:    Maps provider names to ProviderAdapter instances.
+                                  Required.
+        """
+        if credential_resolver is None:
+            raise TypeError("credential_resolver is required.")
+        if provider_factory is None:
+            raise TypeError("provider_factory is required.")
+        self._credential_resolver = credential_resolver
+        self._provider_factory = provider_factory
+
+    def execute(self, request: ProviderExecutionRequest) -> ModelExecutionResult:
+        """Execute the provider request and return a normalized result.
+
+        Args:
+            request: The resolved provider execution request.
+
+        Returns:
+            ModelExecutionResult from the selected provider adapter.
+
+        Raises:
+            SecretResolverError:        Credential resolution failed.
+            LlmProviderAdapterError:    Adapter execution failed.
+        """
+        profile = request.model_resolution.provider_profile
+        credentials = self._credential_resolver.resolve(profile)
+
+        adapter = self._provider_factory.get_provider(request.model_resolution.provider)
+
+        logger.info(
+            "provider_adapter_executor.execute  model_alias=%s  provider=%s",
+            request.model_resolution.model_alias,
+            request.model_resolution.provider,
+        )
+
+        return adapter.generate(request=request, credentials=credentials)
+
+    def execute_stream(self, request: ProviderExecutionRequest) -> Iterator[str]:
+        """Execute the provider request and yield answer text chunks."""
+        profile = request.model_resolution.provider_profile
+        credentials = self._credential_resolver.resolve(profile)
+
+        adapter = self._provider_factory.get_provider(request.model_resolution.provider)
+
+        logger.info(
+            "provider_adapter_executor.execute_stream  model_alias=%s  provider=%s",
+            request.model_resolution.model_alias,
+            request.model_resolution.provider,
+        )
+
+        if hasattr(adapter, "generate_stream"):
+            yield from adapter.generate_stream(request=request, credentials=credentials)
+            return
+
+        # Buffered fallback when adapter lacks native streaming.
+        result = adapter.generate(request=request, credentials=credentials)
+        if result.content:
+            yield result.content
