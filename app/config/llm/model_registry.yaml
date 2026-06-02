@@ -27,6 +27,66 @@ version: 1
 models:
 
   # -------------------------------------------------------------------------
+  # Azure base-model aliases — deployment from AZURE_OPENAI_DEPLOYMENT_* env vars
+  # Optional GPT-5.x aliases remain inactive until env is set (blank deployment OK).
+  # -------------------------------------------------------------------------
+
+  openai_gpt_4_1:
+    description: >-
+      Azure GPT-4.1 full deployment. Deployment from AZURE_OPENAI_DEPLOYMENT_GPT_4_1
+      (default gpt-4.1). Use for strong classifier or advanced generators when provisioned.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+
+  openai_gpt_4_1_mini:
+    description: >-
+      Azure GPT-4.1-mini deployment. From AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI
+      (default gpt-4.1-mini). Safe default for primary classifier.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 25
+
+  openai_gpt_5_4:
+    description: >-
+      Optional Azure GPT-5.4 deployment. Active only when AZURE_OPENAI_DEPLOYMENT_GPT_5_4
+      is set to a provisioned deployment name.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-5.4
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+
+  openai_gpt_5_4_mini:
+    description: >-
+      Optional Azure GPT-5.4-mini deployment. Active only when
+      AZURE_OPENAI_DEPLOYMENT_GPT_5_4_MINI is set.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-5.4-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 25
+
+  openai_gpt_5_5:
+    description: >-
+      Optional Azure GPT-5.5 deployment. Active only when AZURE_OPENAI_DEPLOYMENT_GPT_5_5
+      is set.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-5.5
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+
+  # -------------------------------------------------------------------------
   # Primary aliases — Azure-first
   # -------------------------------------------------------------------------
 
@@ -34,12 +94,38 @@ models:
     description: Azure-first basic math generator. Falls back to native OpenAI.
     provider: azure_openai
     provider_profile: azure_foundry_v1
-    deployment: gpt-4.1
+    deployment: gpt-4.1-mini
     supports_streaming: true
     supports_thinking: false
     timeout_seconds: 30
     fallback_models:
       - math_basic_generator_openai_native
+
+  math_intermediate_generator:
+    description: >-
+      Azure-first intermediate math generator. Active deployment gpt-4.1 until
+      MATH_INTERMEDIATE_DEPLOYMENT (target gpt-5.4-mini) is provisioned in Azure.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+    fallback_models:
+      - math_intermediate_generator_openai_native
+
+  math_advanced_generator:
+    description: >-
+      Azure-first advanced math generator. Active deployment gpt-4.1 until
+      MATH_ADVANCED_DEPLOYMENT (target gpt-5.4-mini) is provisioned in Azure.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1
+    supports_streaming: true
+    supports_thinking: true
+    timeout_seconds: 40
+    fallback_models:
+      - math_advanced_generator_openai_native
 
   math_reasoning_generator:
     description: Azure-first reasoning model for advanced math and multi-step problems.
@@ -56,12 +142,63 @@ models:
     description: Azure-first standard reasoning generator. Falls back to native OpenAI.
     provider: azure_openai
     provider_profile: azure_foundry_v1
-    deployment: gpt-4.1-mini
+    deployment: gpt-4.1
     supports_streaming: true
     supports_thinking: false
     timeout_seconds: 30
     fallback_models:
       - reasoning_standard_generator_openai_native
+
+  reasoning_basic_generator:
+    description: >-
+      Azure-first basic/default reasoning generator. Active deployment gpt-4.1-mini
+      until REASONING_BASIC_DEPLOYMENT (target gpt-4o-mini) is provisioned in Azure.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+    fallback_models:
+      - reasoning_basic_generator_openai_native
+
+  reasoning_intermediate_generator:
+    description: >-
+      Azure-first intermediate reasoning generator. Active deployment gpt-4.1-mini
+      until REASONING_INTERMEDIATE_DEPLOYMENT (target gpt-5.4-mini) is provisioned.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 35
+    fallback_models:
+      - reasoning_intermediate_generator_openai_native
+
+  reasoning_advanced_generator:
+    description: >-
+      Azure-first advanced reasoning generator. Active Azure deployment gpt-4.1.
+      DeepSeek target deferred via reasoning_advanced_generator_deepseek placeholder.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1
+    supports_streaming: true
+    supports_thinking: true
+    timeout_seconds: 45
+    fallback_models:
+      - reasoning_standard_generator
+
+  # Deprecated — use reasoning_advanced_generator. Kept for backward-compatible registry lookups.
+  reasoning_advanced_complex_generator:
+    description: DEPRECATED — use reasoning_advanced_generator.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1
+    supports_streaming: true
+    supports_thinking: true
+    timeout_seconds: 45
+    fallback_models:
+      - reasoning_standard_generator
 
   english_fast_generator:
     description: Azure-first fast English explanation generator. Falls back to native OpenAI.
@@ -109,6 +246,24 @@ models:
     supports_thinking: false
     timeout_seconds: 30
 
+  math_intermediate_generator_openai_native:
+    description: Native OpenAI fallback for intermediate math generator.
+    provider: openai
+    provider_profile: openai_primary
+    model_id: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+
+  math_advanced_generator_openai_native:
+    description: Native OpenAI fallback for advanced math generator.
+    provider: openai
+    provider_profile: openai_primary
+    model_id: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+
   reasoning_standard_generator_openai_native:
     description: Native OpenAI fallback for standard reasoning generator.
     provider: openai
@@ -117,6 +272,128 @@ models:
     supports_streaming: true
     supports_thinking: false
     timeout_seconds: 20
+
+  reasoning_basic_generator_openai_native:
+    description: Native OpenAI fallback for basic reasoning generator.
+    provider: openai
+    provider_profile: openai_primary
+    model_id: gpt-4o-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 20
+
+  reasoning_intermediate_generator_openai_native:
+    description: Native OpenAI fallback for intermediate reasoning generator.
+    provider: openai
+    provider_profile: openai_primary
+    model_id: gpt-4.1-mini
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 25
+
+  reasoning_advanced_generator_deepseek:
+    description: >-
+      Optional DeepSeek reasoning target for controlled route testing.
+      Requires DEEPSEEK_API_KEY. Not referenced in active llm_routes by default.
+    provider: deepseek
+    provider_profile: deepseek_primary
+    model_id: deepseek-reasoner
+    supports_streaming: true
+    supports_thinking: true
+    timeout_seconds: 90
+
+  # Deprecated — use deepseek_reasoning_generator or reasoning_advanced_generator_deepseek.
+  reasoning_advanced_complex_generator_deepseek:
+    description: DEPRECATED — use deepseek_reasoning_generator.
+    provider: deepseek
+    provider_profile: deepseek_primary
+    model_id: deepseek-reasoner
+    supports_streaming: true
+    supports_thinking: true
+    timeout_seconds: 90
+
+  # -------------------------------------------------------------------------
+  # Gemini aliases — optional, for controlled route testing / future image extraction
+  # Not referenced in active production routes unless explicitly configured.
+  # -------------------------------------------------------------------------
+
+  gemini_flash_lite_text:
+    description: >-
+      Gemini flash-lite text generator. Optional provider — set GEMINI_API_KEY
+      and point a route model alias here for controlled testing.
+    provider: gemini
+    provider_profile: gemini_primary
+    model_id: gemini-2.5-flash-lite
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+    fallback_models:
+      - general_fast_generator
+
+  gemini_flash_text:
+    description: >-
+      Gemini flash text generator. Optional provider for controlled route testing.
+    provider: gemini
+    provider_profile: gemini_primary
+    model_id: gemini-2.5-flash
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 30
+    fallback_models:
+      - general_fast_generator
+
+  gemini_image_extractor:
+    description: >-
+      Future image question extraction target (adapter-level multimodal only).
+      supports_streaming=false. Not wired to graph routes yet.
+    provider: gemini
+    provider_profile: gemini_primary
+    model_id: gemini-2.5-flash-lite
+    supports_streaming: false
+    supports_thinking: false
+    timeout_seconds: 30
+
+  # -------------------------------------------------------------------------
+  # DeepSeek aliases — optional, for advanced reasoning/math route testing
+  # -------------------------------------------------------------------------
+
+  deepseek_standard_generator:
+    description: >-
+      DeepSeek chat model for optional controlled route testing.
+      Requires DEEPSEEK_API_KEY.
+    provider: deepseek
+    provider_profile: deepseek_primary
+    model_id: deepseek-chat
+    supports_streaming: true
+    supports_thinking: false
+    timeout_seconds: 60
+    fallback_models:
+      - reasoning_standard_generator
+
+  deepseek_reasoning_generator:
+    description: >-
+      DeepSeek reasoner for advanced reasoning/math when explicitly configured.
+    provider: deepseek
+    provider_profile: deepseek_primary
+    model_id: deepseek-reasoner
+    supports_streaming: true
+    supports_thinking: true
+    timeout_seconds: 90
+    fallback_models:
+      - reasoning_standard_generator
+
+  deepseek_advanced_generator:
+    description: >-
+      DeepSeek advanced reasoning alias (same model as reasoner until a distinct
+      advanced model is provisioned). Not active unless a route points here.
+    provider: deepseek
+    provider_profile: deepseek_primary
+    model_id: deepseek-reasoner
+    supports_streaming: true
+    supports_thinking: true
+    timeout_seconds: 90
+    fallback_models:
+      - deepseek_reasoning_generator
 
   english_fast_generator_openai_native:
     description: Native OpenAI fallback for fast English explanation generator.
@@ -141,10 +418,13 @@ models:
   # -------------------------------------------------------------------------
 
   doubt_solver_classifier:
-    description: Azure-first classifier for doubt solver query classification.
+    description: >-
+      Azure-first classifier. Active deployment gpt-4.1-mini via
+      AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI until GPT-5.4-mini is provisioned.
+      To enable GPT-5.4-mini: set env and point this alias to openai_gpt_5_4_mini.
     provider: azure_openai
     provider_profile: azure_foundry_v1
-    deployment: gpt-4.1
+    deployment: gpt-4.1-mini
     supports_streaming: false
     supports_thinking: false
     timeout_seconds: 20
@@ -159,6 +439,19 @@ models:
     supports_streaming: false
     supports_thinking: false
     timeout_seconds: 15
+
+  doubt_solver_classifier_strong:
+    description: >-
+      Stronger Azure-first classifier. Active deployment gpt-4.1 via
+      AZURE_OPENAI_DEPLOYMENT_GPT_4_1 until GPT-5.4 is provisioned.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-4.1
+    supports_streaming: false
+    supports_thinking: false
+    timeout_seconds: 25
+    fallback_models:
+      - doubt_solver_classifier_openai_native
 
   # -------------------------------------------------------------------------
   # Safe mock — always present for the nuclear fallback / dry-run path

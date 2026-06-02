@@ -255,6 +255,7 @@ class AzureOpenAIProviderAdapter:
                 azure_api_mode (AzureOpenAI or OpenAI).
         """
         self._client_factory = client_factory
+        self.last_stream_finish_reason: str | None = None
 
     # ------------------------------------------------------------------
     # Client builders — one per Azure API mode
@@ -456,12 +457,17 @@ class AzureOpenAIProviderAdapter:
                 max_tokens=request.max_tokens,
                 stream=True,
             )
+            finish_reason: str | None = None
             for chunk in stream:
                 if not chunk.choices:
                     continue
+                fr = getattr(chunk.choices[0], "finish_reason", None)
+                if fr is not None:
+                    finish_reason = fr
                 delta = chunk.choices[0].delta.content or ""
                 if delta:
                     yield delta
+            self.last_stream_finish_reason = finish_reason or "stop"
         except Exception as exc:
             failure_kind = _classify_azure_openai_error(exc)
             raise LlmProviderExecutionError(
@@ -568,6 +574,24 @@ class AzureOpenAIProviderAdapter:
 # ---------------------------------------------------------------------------
 
 
+def _is_deployment_or_model_config_error(exc: BaseException) -> bool:
+    """Detect Azure/OpenAI errors caused by invalid or missing deployment/model."""
+    body = str(getattr(exc, "body", "") or "").lower()
+    message = str(exc).lower()
+    combined = f"{body} {message}"
+    markers = (
+        "deployment",
+        "model_not_found",
+        "model not found",
+        "does not exist",
+        "invalid model",
+        "unknown model",
+        "model is not available",
+        "no such model",
+    )
+    return any(marker in combined for marker in markers)
+
+
 def _classify_azure_openai_error(exc: BaseException) -> str:
     """Map an openai SDK exception (Azure path) to a safe ProviderFailureKind string.
 
@@ -604,6 +628,8 @@ def _classify_azure_openai_error(exc: BaseException) -> str:
         return "provider_unavailable"
 
     if isinstance(exc, _openai.BadRequestError):
+        if _is_deployment_or_model_config_error(exc):
+            return "model_not_found"
         return "invalid_request"
 
     if isinstance(exc, _openai.APIStatusError):
@@ -613,6 +639,8 @@ def _classify_azure_openai_error(exc: BaseException) -> str:
         if status == 429:
             return "rate_limited"
         if status == 404:
+            return "model_not_found"
+        if status == 400 and _is_deployment_or_model_config_error(exc):
             return "model_not_found"
         if status >= 500:
             return "provider_unavailable"

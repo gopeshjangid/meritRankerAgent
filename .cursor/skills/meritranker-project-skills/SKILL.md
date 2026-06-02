@@ -36,6 +36,7 @@ Pick the **minimum role set** that satisfies the task. Escalate when scope, risk
 | User intent | Active roles (in order) | Planning required? |
 |---|---|---|
 | New feature / major capability | PM → BA → Solution Architect → AI Solution Architect → Engineer → (Architect re-check) → QA + Security + Performance + Docs → Release Gatekeeper | Yes — no code until 1–4 align |
+| Prompt / generator / classifier wording changes | Prompt Engineer → Python Agent Engineer (if code) → QA | Plan or task brief for prompt scope |
 | Approved implementation only | Python Agent Engineer → QA (+ Security/Performance if applicable) → Docs Maintainer | Plan must exist |
 | Bug fix | Engineer (use bugfix template) → QA → Security if logs/auth/secrets touched | Light — document in bugfix report |
 | Small fix (typo, comment, single-line) | Engineer hat + `make check` | No |
@@ -53,6 +54,7 @@ Pick the **minimum role set** that satisfies the task. Escalate when scope, risk
 | Solution Architect | [skills/roles/solution-architect.md](../../../skills/roles/solution-architect.md) |
 | AI Solution Architect | [skills/roles/ai-solution-architect.md](../../../skills/roles/ai-solution-architect.md) |
 | Python Agent Engineer | [skills/roles/python-agent-engineer.md](../../../skills/roles/python-agent-engineer.md) |
+| Prompt Engineer | [skills/roles/prompt-engineer.md](../../../skills/roles/prompt-engineer.md) |
 | QA Reviewer | [skills/roles/qa-reviewer.md](../../../skills/roles/qa-reviewer.md) |
 | Security Reviewer | [skills/roles/security-reviewer.md](../../../skills/roles/security-reviewer.md) |
 | Performance-Cost Reviewer | [skills/roles/performance-cost-reviewer.md](../../../skills/roles/performance-cost-reviewer.md) |

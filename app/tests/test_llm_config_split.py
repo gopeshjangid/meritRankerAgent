@@ -228,11 +228,42 @@ class TestNewModelAliases:
         assert route is not None
         assert route.model == "math_basic_generator"
 
-    def test_math_advanced_uses_math_reasoning_generator(self) -> None:
+    def test_math_advanced_uses_math_advanced_generator(self) -> None:
         reg = LlmConfigRegistry()
         route = reg.get_route("math", "generator", "advanced")
         assert route is not None
-        assert route.model == "math_reasoning_generator"
+        assert route.model == "math_advanced_generator"
+
+    def test_math_intermediate_uses_math_intermediate_generator(self) -> None:
+        reg = LlmConfigRegistry()
+        route = reg.get_route("math", "generator", "intermediate")
+        assert route is not None
+        assert route.model == "math_intermediate_generator"
+
+    def test_reasoning_default_uses_reasoning_basic_generator(self) -> None:
+        reg = LlmConfigRegistry()
+        route = reg.get_route("reasoning", "generator", "default")
+        assert route is not None
+        assert route.model == "reasoning_basic_generator"
+
+    def test_reasoning_intermediate_uses_reasoning_intermediate_generator(self) -> None:
+        reg = LlmConfigRegistry()
+        route = reg.get_route("reasoning", "generator", "intermediate")
+        assert route is not None
+        assert route.model == "reasoning_intermediate_generator"
+
+    def test_reasoning_advanced_uses_reasoning_advanced_generator(self) -> None:
+        reg = LlmConfigRegistry()
+        route = reg.get_route("reasoning", "generator", "advanced")
+        assert route is not None
+        assert route.model == "reasoning_advanced_generator"
+
+    def test_no_active_route_uses_reasoning_advanced_complex_generator(self) -> None:
+        reg = LlmConfigRegistry()
+        for difficulty in ("default", "basic", "intermediate", "advanced"):
+            route = reg.get_route("reasoning", "generator", difficulty)
+            assert route is not None
+            assert route.model != "reasoning_advanced_complex_generator"
 
     def test_general_default_uses_general_fast_generator(self) -> None:
         reg = LlmConfigRegistry()

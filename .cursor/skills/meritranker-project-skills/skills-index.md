@@ -41,6 +41,7 @@
 - [solution-architect.md](../../../skills/roles/solution-architect.md)
 - [ai-solution-architect.md](../../../skills/roles/ai-solution-architect.md)
 - [python-agent-engineer.md](../../../skills/roles/python-agent-engineer.md)
+- [prompt-engineer.md](../../../skills/roles/prompt-engineer.md)
 - [qa-reviewer.md](../../../skills/roles/qa-reviewer.md)
 - [security-reviewer.md](../../../skills/roles/security-reviewer.md)
 - [performance-cost-reviewer.md](../../../skills/roles/performance-cost-reviewer.md)

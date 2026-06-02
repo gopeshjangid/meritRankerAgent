@@ -351,3 +351,57 @@ class TestDefaultConfigNoErrors:
 
         with pytest.raises(ValueError):
             cfg_module.get_settings()
+
+
+class TestClassifierThresholdConfig:
+    def test_default_threshold_is_092(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", raising=False)
+        monkeypatch.delenv("CLASSIFIER_CONFIDENCE_FALLBACK_THRESHOLD", raising=False)
+        _reset_settings()
+        assert cfg_module.get_settings().classifier_confidence_fallback_threshold == 0.93
+
+    def test_new_env_threshold_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", "0.88")
+        _reset_settings()
+        assert cfg_module.get_settings().classifier_confidence_fallback_threshold == 0.88
+
+    def test_legacy_env_threshold_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", raising=False)
+        monkeypatch.setenv("CLASSIFIER_CONFIDENCE_FALLBACK_THRESHOLD", "0.85")
+        _reset_settings()
+        assert cfg_module.get_settings().classifier_confidence_fallback_threshold == 0.85
+
+    def test_invalid_threshold_raises_value_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", "not-a-float")
+        _reset_settings()
+        with pytest.raises(ValueError, match="DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD"):
+            cfg_module.get_settings()
+
+    def test_out_of_range_threshold_raises_value_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", "1.5")
+        _reset_settings()
+        with pytest.raises(ValueError, match="between 0.0 and 1.0"):
+            cfg_module.get_settings()
+
+
+class TestWebSearchConfigDefaults:
+    def test_web_search_disabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("WEB_SEARCH_ENABLED", raising=False)
+        _reset_settings()
+        settings = cfg_module.get_settings()
+        assert settings.web_search_enabled is False
+
+    def test_web_search_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("WEB_SEARCH_PROVIDER", raising=False)
+        monkeypatch.delenv("WEB_SEARCH_MAX_RESULTS", raising=False)
+        monkeypatch.delenv("WEB_SEARCH_MAX_CONTEXT_CHARS", raising=False)
+        _reset_settings()
+        settings = cfg_module.get_settings()
+        assert settings.web_search_provider == "tavily"
+        assert settings.web_search_max_results == 5
+        assert settings.web_search_max_context_chars == 2500
+        assert settings.web_search_allow_exam_prep_fallback is True
+        assert settings.web_search_exam_prep_max_selected_results == 2
+        assert settings.web_search_require_official_for_exam_updates is True

@@ -45,10 +45,24 @@ class TestProviderAdapterFactoryDefault:
         adapter = factory.get_provider("azure_openai")
         assert isinstance(adapter, AzureOpenAIProviderAdapter)
 
+    def test_returns_gemini_adapter(self) -> None:
+        factory = ProviderAdapterFactory()
+        adapter = factory.get_provider("gemini")
+        from services.llm.providers.openai_compatible_adapter import GeminiProviderAdapter
+
+        assert isinstance(adapter, GeminiProviderAdapter)
+
+    def test_returns_deepseek_adapter(self) -> None:
+        factory = ProviderAdapterFactory()
+        adapter = factory.get_provider("deepseek")
+        from services.llm.providers.openai_compatible_adapter import DeepSeekProviderAdapter
+
+        assert isinstance(adapter, DeepSeekProviderAdapter)
+
     def test_unsupported_provider_raises_config_error(self) -> None:
         factory = ProviderAdapterFactory()
-        with pytest.raises(LlmProviderConfigurationError, match="gemini"):
-            factory.get_provider("gemini")
+        with pytest.raises(LlmProviderConfigurationError, match="unknown_provider"):
+            factory.get_provider("unknown_provider")
 
     def test_unsupported_provider_error_mentions_supported(self) -> None:
         factory = ProviderAdapterFactory()
@@ -58,6 +72,8 @@ class TestProviderAdapterFactoryDefault:
         assert "mock" in msg
         assert "openai" in msg
         assert "azure_openai" in msg
+        assert "gemini" in msg
+        assert "deepseek" in msg
 
     def test_empty_provider_name_raises_config_error(self) -> None:
         factory = ProviderAdapterFactory()

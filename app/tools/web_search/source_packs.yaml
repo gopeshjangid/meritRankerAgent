@@ -1,0 +1,238 @@
+# Starter source packs for authoritative web search (extend via config, not Python).
+#
+# Tier rules:
+# - trusted_domains: primary/official/authoritative sources.
+# - reputed_domains: credible news, institutional explainers, reputable reference.
+# - exam_prep_domains: supporting-only exam-prep/coaching platforms — never confirm
+#   official dates/results/eligibility/notifications alone.
+# - blocked_domains: pack-specific domains never selected unless future override exists.
+# - global_blocked: social/UGC/video/low-trust domains blocked across all packs.
+#
+# These are starter packs — expand gradually from safe retrieval logs, not bulk lists.
+
+global_blocked:
+  domains:
+    - youtube.com
+    - facebook.com
+    - instagram.com
+    - x.com
+    - quora.com
+    - medium.com
+    - reddit.com
+
+packs:
+  economy_india:
+    topic: finance
+    trusted_domains:
+      - rbi.org.in
+      - pib.gov.in
+      - mospi.gov.in
+      - dea.gov.in
+      - indiabudget.gov.in
+      - finance.gov.in
+      - prsindia.org
+    reputed_domains:
+      - business-standard.com
+      - thehindubusinessline.com
+      - livemint.com
+      - indianexpress.com
+      - thehindu.com
+      - moneycontrol.com
+    exam_prep_domains:
+      - adda247.com
+      - testbook.com
+      - pw.live
+      - unacademy.com
+      - drishtiias.com
+    blocked_domains: []
+
+  current_affairs_india:
+    topic: news
+    trusted_domains:
+      - pib.gov.in
+      - india.gov.in
+      - mygov.in
+      - pmindia.gov.in
+      - prsindia.org
+    reputed_domains:
+      - thehindu.com
+      - indianexpress.com
+      - business-standard.com
+      - livemint.com
+      - hindustantimes.com
+      - timesofindia.indiatimes.com
+    exam_prep_domains:
+      - adda247.com
+      - testbook.com
+      - pw.live
+      - unacademy.com
+      - drishtiias.com
+      - vajiramandravi.com
+    blocked_domains: []
+
+  government_schemes_india:
+    topic: news
+    trusted_domains:
+      - pib.gov.in
+      - india.gov.in
+      - mygov.in
+      - pmindia.gov.in
+      - uidai.gov.in
+      - nrega.nic.in
+      - dbtbharat.gov.in
+    reputed_domains:
+      - prsindia.org
+      - thehindu.com
+      - indianexpress.com
+    exam_prep_domains:
+      - adda247.com
+      - testbook.com
+      - pw.live
+      - drishtiias.com
+    blocked_domains: []
+
+  exam_updates_india:
+    topic: news
+    trusted_domains:
+      - upsc.gov.in
+      - ssc.gov.in
+      - ibps.in
+      - nta.ac.in
+      - rbi.org.in
+      - ctet.nic.in
+      - csirnet.nta.ac.in
+      - jeemain.nta.ac.in
+      - neet.nta.nic.in
+      - joinindianarmy.nic.in
+      - joinindiannavy.gov.in
+      - indianairforce.nic.in
+    reputed_domains: []
+    exam_prep_domains:
+      - adda247.com
+      - testbook.com
+      - pw.live
+      - unacademy.com
+      - careerpower.in
+    blocked_domains: []
+
+  polity_india:
+    topic: general
+    trusted_domains:
+      - indiacode.nic.in
+      - eci.gov.in
+      - loksabha.nic.in
+      - rajyasabha.nic.in
+      - prsindia.org
+      - lawmin.gov.in
+      - legislative.gov.in
+    reputed_domains:
+      - thehindu.com
+      - indianexpress.com
+      - britannica.com
+    exam_prep_domains:
+      - drishtiias.com
+      - vajiramandravi.com
+      - unacademy.com
+      - testbook.com
+    blocked_domains: []
+
+  geography_india:
+    topic: general
+    trusted_domains:
+      - imd.gov.in
+      - isro.gov.in
+      - censusindia.gov.in
+      - mospi.gov.in
+      - bhuvan.nrsc.gov.in
+      - moes.gov.in
+    reputed_domains:
+      - britannica.com
+      - nationalgeographic.com
+      - thehindu.com
+    exam_prep_domains:
+      - drishtiias.com
+      - vajiramandravi.com
+      - unacademy.com
+      - testbook.com
+    blocked_domains: []
+
+  science_current:
+    topic: news
+    trusted_domains:
+      - isro.gov.in
+      - drdo.gov.in
+      - pib.gov.in
+      - dst.gov.in
+      - dbtindia.gov.in
+      - who.int
+      - nasa.gov
+    reputed_domains:
+      - nature.com
+      - science.org
+      - sciencedaily.com
+      - thehindu.com
+    exam_prep_domains:
+      - pw.live
+      - unacademy.com
+      - drishtiias.com
+      - testbook.com
+    blocked_domains: []
+
+  environment_india:
+    topic: news
+    trusted_domains:
+      - moef.gov.in
+      - pib.gov.in
+      - imd.gov.in
+      - cpcb.nic.in
+      - moes.gov.in
+      - unep.org
+      - unfccc.int
+    reputed_domains:
+      - downtoearth.org.in
+      - thehindu.com
+      - indianexpress.com
+    exam_prep_domains:
+      - drishtiias.com
+      - vajiramandravi.com
+      - testbook.com
+      - unacademy.com
+    blocked_domains: []
+
+  sports_current_affairs:
+    topic: news
+    trusted_domains:
+      - olympics.com
+      - icc-cricket.com
+      - fifa.com
+      - the-aiff.com
+      - hockeyindia.org
+    reputed_domains:
+      - espncricinfo.com
+      - sportstar.thehindu.com
+      - thehindu.com
+    exam_prep_domains:
+      - adda247.com
+      - testbook.com
+    blocked_domains: []
+
+  international_current_affairs:
+    topic: news
+    trusted_domains:
+      - un.org
+      - who.int
+      - worldbank.org
+      - imf.org
+      - wto.org
+      - nato.int
+    reputed_domains:
+      - reuters.com
+      - apnews.com
+      - bbc.com
+      - aljazeera.com
+      - thehindu.com
+    exam_prep_domains:
+      - drishtiias.com
+      - vajiramandravi.com
+      - testbook.com
+    blocked_domains: []

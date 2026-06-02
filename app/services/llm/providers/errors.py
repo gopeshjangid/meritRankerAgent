@@ -36,19 +36,22 @@ ProviderFailureKind = Literal[
     "insufficient_quota",
     "rate_limited",
     "authentication_failed",
+    "provider_not_configured",
     "model_not_found",
     "timeout",
     "provider_unavailable",
     "invalid_request",
+    "safety_blocked",
     "unknown_provider_error",
 ]
 
 # Failure kinds that are eligible for model-level fallback in the executor.
-# Config/programming errors (invalid_request) are NOT eligible.
+# Config/programming errors (invalid_request) and safety blocks are NOT eligible.
 FALLBACK_ELIGIBLE_FAILURE_KINDS: frozenset[str] = frozenset({
     "insufficient_quota",
     "rate_limited",
     "authentication_failed",
+    "provider_not_configured",
     "model_not_found",
     "timeout",
     "provider_unavailable",

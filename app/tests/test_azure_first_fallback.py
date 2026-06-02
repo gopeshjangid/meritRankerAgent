@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import textwrap
 import types
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -665,6 +666,37 @@ class TestModelExecutionFallback:
         assert result.fallback_used is True
         assert result.content == "Rate fallback answer."
 
+    def test_stream_invalid_deployment_triggers_fallback(self, tmp_path: Path) -> None:
+        deployment_error = LlmProviderExecutionError(
+            "Azure deployment not found",
+            failure_kind="model_not_found",
+            provider="azure_openai",
+            model_alias="azure_fast",
+        )
+
+        class _StreamFallbackExecutor:
+            def execute_stream(self, request: ProviderExecutionRequest) -> Iterator[str]:
+                alias = request.model_resolution.model_alias
+                if alias == "azure_fast":
+                    raise deployment_error
+                yield "streamed fallback"
+
+            def execute(self, request: ProviderExecutionRequest) -> ModelExecutionResult:
+                return ModelExecutionResult(
+                    content="buffered",
+                    model=request.model_resolution.model_alias,
+                    provider="openai",
+                )
+
+        executor = RegistryBackedModelExecutor(
+            provider_executor=_StreamFallbackExecutor(),
+            model_config_resolver=_resolver(tmp_path),
+        )
+        chunks = list(
+            executor.execute_stream(route_decision=_route_decision(), messages=_messages())
+        )
+        assert chunks == ["streamed fallback"]
+
     def test_primary_timeout_triggers_fallback(self, tmp_path: Path) -> None:
         error = LlmProviderExecutionError(
             "timeout",
@@ -925,6 +957,50 @@ class TestOpenAIErrorMapping:
             assert result in ("rate_limited", "insufficient_quota")
         except Exception:
             pytest.skip("Cannot construct RateLimitError for azure test")
+
+    def test_azure_bad_request_deployment_error_maps_model_not_found(self) -> None:
+        try:
+            import openai  # noqa: PLC0415
+        except ImportError:
+            pytest.skip("openai not installed")
+
+        mock_resp = types.SimpleNamespace(
+            status_code=400,
+            headers={},
+            text="",
+            json=lambda: {},
+            request=types.SimpleNamespace(method="POST", url="https://my.azure.com"),
+        )
+        try:
+            exc = openai.BadRequestError(
+                "Deployment gpt-5.4-mini does not exist",
+                response=mock_resp,
+                body={"error": {"message": "Deployment not found"}},
+            )
+            assert _classify_azure_openai_error(exc) == "model_not_found"
+        except Exception:
+            pytest.skip("Cannot construct BadRequestError for azure test")
+
+    def test_primary_invalid_deployment_triggers_fallback(self, tmp_path: Path) -> None:
+        """Invalid deployment (model_not_found) on primary triggers fallback_models."""
+        deployment_error = LlmProviderExecutionError(
+            "Azure deployment not found",
+            failure_kind="model_not_found",
+            provider="azure_openai",
+            model_alias="azure_fast",
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            raise_for={"azure_fast": deployment_error},
+            return_for={"openai_native_fallback": "Fallback after bad deployment."},
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+        result = executor.execute(route_decision=_route_decision(), messages=_messages())
+        assert result.content == "Fallback after bad deployment."
+        assert result.fallback_used is True
+        assert fake_executor.call_log == ["azure_fast", "openai_native_fallback"]
 
 
 class TestProviderExecutionErrorAttributes:
@@ -1302,13 +1378,19 @@ class TestProductionModelRegistry:
         assert "safe_mock" in registry.model_map
 
     def test_azure_deployment_field_set(self) -> None:
-        """All Azure-primary models must have a deployment field (even if placeholder)."""
+        """Active Azure models must have deployment; optional GPT-5.x may be blank."""
+        optional_blank = frozenset(
+            {"openai_gpt_5_4", "openai_gpt_5_4_mini", "openai_gpt_5_5"}
+        )
         registry = self._live_registry()
         for alias, cfg in registry.model_map.items():
-            if cfg.provider == "azure_openai":
-                assert cfg.deployment, (
-                    f"Azure model '{alias}' is missing the deployment field"
-                )
+            if cfg.provider != "azure_openai":
+                continue
+            if alias in optional_blank:
+                continue
+            assert cfg.deployment, (
+                f"Azure model '{alias}' is missing the deployment field"
+            )
 
     def test_openai_native_fallbacks_have_model_id(self) -> None:
         registry = self._live_registry()

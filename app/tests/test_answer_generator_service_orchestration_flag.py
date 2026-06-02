@@ -38,6 +38,15 @@ from services.llm_orchestration.prompt_resolver import PromptResolver
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _disable_answer_quality_for_adapter_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These adapter tests assert single mock executor call — disable quality rewrite."""
+    import config as cfg_module
+
+    monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "false")
+    cfg_module._settings = None
+
+
 def _make_route_decision(req: RouteRequest) -> RouteDecision:
     """Return a fixed safe_mock RouteDecision for any RouteRequest."""
     return RouteDecision(

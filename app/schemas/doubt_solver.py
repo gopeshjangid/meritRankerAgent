@@ -16,9 +16,36 @@ Models:
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+def _normalize_retrieval_tags(raw_tags: Any, *, max_tags: int = 10) -> list[str]:
+    if raw_tags is None:
+        return []
+    items: list[str] = []
+    if isinstance(raw_tags, str):
+        items = [t.strip() for t in raw_tags.replace(";", ",").split(",") if t.strip()]
+    elif isinstance(raw_tags, (list, tuple, set)):
+        for entry in raw_tags:
+            if entry is None:
+                continue
+            text = str(entry).strip()
+            if text:
+                items.append(text)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for tag in items:
+        clean = re.sub(r"[^a-z0-9]+", "_", tag.lower()).strip("_")
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        normalized.append(clean)
+        if len(normalized) >= max_tags:
+            break
+    return normalized
 
 
 class DoubtSolverRequest(BaseModel):
@@ -69,7 +96,28 @@ class QueryClassification(BaseModel):
     )
     topic: str | None = Field(
         default=None,
-        description="Detected topic within the subject, if identifiable.",
+        description="Human-readable exam topic label from classifier.",
+    )
+    topic_confidence: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Calibrated confidence for topic/pattern hint fields.",
+    )
+    pattern_topic_candidate: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Canonical patternTopicKey candidate (UPPER_SNAKE) when obvious.",
+    )
+    pattern_family_candidate: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Canonical patternFamilyKey candidate when obvious.",
+    )
+    retrieval_tags: list[str] = Field(
+        default_factory=list,
+        max_length=12,
+        description="Compact normalized tags for KB rerank signals (not strict filters).",
     )
     response_style: Literal["step_by_step", "short_answer", "simple_explanation"] = Field(
         default="step_by_step",
@@ -98,6 +146,33 @@ class QueryClassification(BaseModel):
         max_length=500,
         description="Short non-sensitive explanation of the classification (from LLM only).",
     )
+    need_web_search: bool = Field(
+        default=False,
+        description="True when fresh web context is required for the answer.",
+    )
+    web_search_reason: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Compact reason enum for web search trigger (internal only).",
+    )
+    web_search_query: str | None = Field(
+        default=None,
+        max_length=256,
+        description="Concise web search query without personal data (internal only).",
+    )
+
+    @field_validator("retrieval_tags", mode="before")
+    @classmethod
+    def _validate_retrieval_tags(cls, value: Any) -> list[str]:
+        return _normalize_retrieval_tags(value, max_tags=12)
+
+    @field_validator("pattern_topic_candidate", "pattern_family_candidate", mode="before")
+    @classmethod
+    def _strip_pattern_candidates(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
 
 class AnswerOutput(BaseModel):
@@ -208,8 +283,37 @@ class DoubtSolverClassification(BaseModel):
     intent: str = Field(default="explain")
     difficulty: str = Field(default="default")
     retrieval_required: bool = Field(default=False)
+    topic: str | None = Field(
+        default=None,
+        max_length=256,
+        description="Human-readable topic hint for retrieval (optional).",
+    )
+    topic_confidence: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Classifier confidence for retrieval hints.",
+    )
+    pattern_topic_candidate: str | None = Field(default=None, max_length=128)
+    pattern_family_candidate: str | None = Field(default=None, max_length=128)
+    retrieval_tags: list[str] = Field(
+        default_factory=list,
+        max_length=12,
+        description="Normalized retrieval tags for rerank (optional).",
+    )
+    need_web_search: bool = Field(
+        default=False,
+        description="True when fresh web context is required.",
+    )
+    web_search_reason: str | None = Field(default=None, max_length=64)
+    web_search_query: str | None = Field(default=None, max_length=256)
 
     model_config = {"str_strip_whitespace": True}
+
+    @field_validator("retrieval_tags", mode="before")
+    @classmethod
+    def _validate_retrieval_tags(cls, value: Any) -> list[str]:
+        return _normalize_retrieval_tags(value, max_tags=12)
 
 
 # ---------------------------------------------------------------------------

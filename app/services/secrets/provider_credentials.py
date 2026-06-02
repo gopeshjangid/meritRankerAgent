@@ -28,7 +28,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from schemas.llm_routing import ProviderProfile
-from services.secrets.errors import SecretResolverUnsupportedError
+from services.secrets.errors import SecretNotFoundError, SecretResolverUnsupportedError
 from services.secrets.secret_resolver import SecretResolver
 
 
@@ -135,10 +135,9 @@ class ProviderCredentialResolver:
                 "[DEFER] Secrets Manager and AgentCore Identity support is planned."
             )
 
-        api_key = (
-            self._secret_resolver.get_secret(profile.api_key_env)
-            if profile.api_key_env is not None
-            else None
+        api_key = self._resolve_optional_secret(
+            profile.api_key_env,
+            optional=profile.optional_api_key,
         )
         endpoint = (
             self._secret_resolver.get_secret(profile.endpoint_env)
@@ -150,10 +149,9 @@ class ProviderCredentialResolver:
             if profile.api_version_env is not None
             else None
         )
-        base_url = (
-            self._secret_resolver.get_secret(profile.base_url_env)
-            if profile.base_url_env is not None
-            else None
+        base_url = self._resolve_optional_secret(
+            profile.base_url_env,
+            optional=profile.optional_base_url,
         )
 
         return ProviderCredentials(
@@ -164,3 +162,19 @@ class ProviderCredentialResolver:
             base_url=base_url,
             azure_api_mode=profile.azure_api_mode,
         )
+
+    def _resolve_optional_secret(
+        self,
+        env_name: str | None,
+        *,
+        optional: bool,
+    ) -> str | None:
+        """Resolve an env var reference, optionally returning None when absent."""
+        if env_name is None:
+            return None
+        try:
+            return self._secret_resolver.get_secret(env_name)
+        except SecretNotFoundError:
+            if optional:
+                return None
+            raise

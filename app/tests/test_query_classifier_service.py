@@ -20,12 +20,19 @@ from __future__ import annotations
 
 import json
 
+import pytest
+from pydantic import ValidationError
+
 import config as cfg_module
 from schemas.doubt_solver import QueryClassification
 from services.query_classifier_service import (
     _CLASSIFIER_ROLE,
     _classify_deterministic,
+    _load_classifier_prompt,
+    apply_classification_policy,
+    apply_classification_sanity,
     classify_query,
+    get_classifier_confidence_threshold,
 )
 
 # ---------------------------------------------------------------------------
@@ -49,6 +56,11 @@ def _make_valid_llm_response_content(
             "intent": intent,
             "subject": subject,
             "topic": "percentage",
+            "topic_confidence": 0.88,
+            "pattern_topic_candidate": "PERCENTAGE",
+            "pattern_family_candidate": None,
+            "retrieval_tags": ["ratio_parts", "weighted_percentage"],
+            "difficulty": "intermediate",
             "response_style": "step_by_step",
             "confidence": confidence,
             "retrieval_need": "none",
@@ -394,3 +406,603 @@ class TestRoleNotConfigured:
         assert result.classification_source == "fallback"
         assert result.confidence <= 0.55
         _reset_settings()
+
+
+class TestClassificationPolicy:
+    def test_high_confidence_default_becomes_advanced_for_sbi_po(self) -> None:
+        classification = {
+            "subject": "math",
+            "intent": "explain",
+            "difficulty": "default",
+            "retrieval_required": True,
+        }
+        result = apply_classification_policy(
+            "simple explanation of SBI PO coded inequality",
+            classification,
+            request_id="req-policy-1",
+        )
+        assert result["difficulty"] == "advanced"
+
+    def test_sbi_po_signal_forces_advanced(self) -> None:
+        classification = {"subject": "reasoning", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy(
+            "Explain seating arrangement for SBI PO",
+            classification,
+        )
+        assert result["difficulty"] == "advanced"
+
+    def test_floor_puzzle_forces_advanced(self) -> None:
+        classification = {"subject": "reasoning", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy(
+            "How to solve floor puzzle?",
+            classification,
+        )
+        assert result["difficulty"] == "advanced"
+
+    def test_basic_explanation_stays_basic_without_exam_signal(self) -> None:
+        classification = {"subject": "math", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy(
+            "Give a basic explanation of percentage",
+            classification,
+        )
+        assert result["difficulty"] == "basic"
+
+    def test_advanced_signal_wins_over_simple_wording(self) -> None:
+        classification = {"subject": "math", "intent": "explain", "difficulty": "basic"}
+        result = apply_classification_policy(
+            "simple explanation of IBPS PO caselet",
+            classification,
+        )
+        assert result["difficulty"] == "advanced"
+
+    def test_no_change_when_no_policy_signal(self) -> None:
+        classification = {"subject": "math", "intent": "explain", "difficulty": "intermediate"}
+        result = apply_classification_policy("Explain ratio basics", classification)
+        assert result["difficulty"] == "intermediate"
+
+    def test_profit_loss_query_becomes_math(self) -> None:
+        classification = {"subject": "general", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy(
+            "Explain profit and loss discount marked price trap",
+            classification,
+        )
+        assert result["subject"] == "math"
+
+    def test_mixture_alligation_becomes_math(self) -> None:
+        classification = {"subject": "general", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy(
+            "How to solve mixture and alligation?",
+            classification,
+        )
+        assert result["subject"] == "math"
+
+    def test_coded_inequality_becomes_reasoning(self) -> None:
+        classification = {"subject": "general", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy(
+            "Explain coded inequality for bank exam",
+            classification,
+        )
+        assert result["subject"] == "reasoning"
+        assert result["difficulty"] == "advanced"
+
+    def test_seating_arrangement_becomes_reasoning(self) -> None:
+        classification = {"subject": "general", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy(
+            "Explain circular seating arrangement",
+            classification,
+        )
+        assert result["subject"] == "reasoning"
+        assert result["difficulty"] == "advanced"
+
+    def test_floor_puzzle_becomes_advanced(self) -> None:
+        classification = {"subject": "reasoning", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy(
+            "Solve floor puzzle with building numbered floors",
+            classification,
+        )
+        assert result["difficulty"] == "advanced"
+
+    def test_structural_complexity_becomes_advanced(self) -> None:
+        classification = {"subject": "reasoning", "intent": "explain", "difficulty": "default"}
+        query = (
+            "A sits left of B; C who is not facing north; D given that E cannot sit "
+            "with F; G which is neither adjacent to H; I such that J does not face center."
+        )
+        result = apply_classification_policy(query, classification)
+        assert result["difficulty"] == "advanced"
+
+    def test_simple_direction_not_overcorrected_to_advanced(self) -> None:
+        classification = {"subject": "reasoning", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy(
+            "What is direction sense?",
+            classification,
+        )
+        assert result["difficulty"] in {"default", "intermediate"}
+
+    def test_policy_summary_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        classification = {"subject": "reasoning", "intent": "explain", "difficulty": "default"}
+        with caplog.at_level("INFO"):
+            apply_classification_policy(
+                "Explain coded inequality for bank exam",
+                classification,
+                request_id="req-summary",
+            )
+        summaries = [
+            r.message for r in caplog.records if "classification_policy_summary" in r.message
+        ]
+        assert summaries
+        assert "pattern_topic=CODED_INEQUALITY" in summaries[0]
+
+    def test_grammar_becomes_english(self) -> None:
+        classification = {"subject": "general", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy(
+            "Explain grammar rules for sentence correction",
+            classification,
+        )
+        assert result["subject"] == "english"
+
+    def test_vague_query_not_overcorrected(self) -> None:
+        classification = {"subject": "math", "intent": "explain", "difficulty": "default"}
+        result = apply_classification_policy("What is the answer?", classification)
+        assert result["subject"] == "math"
+        assert result["difficulty"] == "default"
+
+    def test_policy_always_logs_checked(self, caplog: pytest.LogCaptureFixture) -> None:
+        classification = {"subject": "math", "intent": "explain", "difficulty": "default"}
+        with caplog.at_level("INFO"):
+            apply_classification_policy(
+                "What is the answer?",
+                classification,
+                request_id="req-policy-log",
+            )
+        policy_logs = [r.message for r in caplog.records if "classification_policy" in r.message]
+        assert policy_logs
+        assert "policy_checked=true" in policy_logs[0]
+        assert "policy_applied=false" in policy_logs[0]
+
+
+class TestClassifierPromptFoundation:
+    def test_prompt_uses_solving_method_principle(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "solving method" in prompt.lower()
+        assert "superficial keywords" in prompt.lower()
+        assert "not" in prompt.lower()
+
+    def test_prompt_covers_broad_exam_prep_domains(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "government" in prompt.lower() or "competitive exam" in prompt.lower()
+        assert "quantitative" in prompt.lower() or "`math`" in prompt
+        assert "reasoning" in prompt.lower()
+        assert "english" in prompt.lower()
+        assert "general studies" in prompt.lower() or "GK" in prompt
+
+    def test_prompt_defines_classification_dimensions(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "solving method" in prompt.lower()
+        assert "exam" in prompt.lower()
+        assert "difficulty" in prompt.lower()
+        assert "confidence" in prompt.lower()
+
+    def test_prompt_has_method_domain_mapping_table(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "Method → domain rules" in prompt
+        assert "TIME_SPEED_DISTANCE" in prompt
+        assert "BLOOD_RELATION" in prompt
+        assert "GRAMMAR" in prompt
+
+    def test_prompt_marks_boundary_illustrations_non_exhaustive(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "Boundary illustrations" in prompt
+        assert "non-exhaustive" in prompt.lower()
+
+    def test_prompt_contains_confidence_calibration_rules(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert ">= 0.93" in prompt
+        assert "1.00" in prompt
+        assert "below 0.93" in prompt.lower()
+
+    def test_prompt_requires_json_only_output(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "only" in prompt.lower()
+        assert "JSON" in prompt
+
+
+class TestExamClassificationMatrix:
+    """Representative exam domains — not a fixed example-fix list."""
+
+    @pytest.mark.parametrize(
+        ("query", "expected_subject"),
+        [
+            (
+                (
+                    "A shopkeeper marks an article 40% above cost and gives 10% discount. "
+                    "Find profit percent."
+                ),
+                "math",
+            ),
+            (
+                "Syllogism: All cats are dogs. Some dogs are birds. Which conclusions follow?",
+                "reasoning",
+            ),
+            (
+                "Choose the grammatically correct sentence from grammar options below.",
+                "english",
+            ),
+            (
+                "Who is the current RBI governor?",
+                "general",
+            ),
+            (
+                "Mixture of milk and water in ratio 3:2. How much water to add?",
+                "math",
+            ),
+        ],
+    )
+    def test_low_confidence_general_can_be_corrected_by_policy(
+        self, query: str, expected_subject: str
+    ) -> None:
+        result = apply_classification_policy(
+            query,
+            {"subject": "general", "intent": "solve", "difficulty": "default"},
+            classifier_confidence=0.72,
+        )
+        assert result["subject"] == expected_subject
+
+    @pytest.mark.parametrize(
+        ("query", "initial_subject", "expected_subject"),
+        [
+            (
+                "Syllogism with statements: All A are B. Conclusions: Some B are C. Which follows?",
+                "general",
+                "reasoning",
+            ),
+            (
+                "Find synonym of ephemeral in the given options.",
+                "general",
+                "english",
+            ),
+        ],
+    )
+    def test_explicit_pattern_family_corrections(
+        self, query: str, initial_subject: str, expected_subject: str
+    ) -> None:
+        result = apply_classification_policy(
+            query,
+            {"subject": initial_subject, "intent": "explain", "difficulty": "default"},
+            classifier_confidence=0.75,
+        )
+        assert result["subject"] == expected_subject
+
+
+class TestRegressionDisambiguationBoundaries:
+    """Regression-only boundary cases — not the design target."""
+
+    def test_regression_quant_motion_not_overridden_to_reasoning(self) -> None:
+        query = (
+            "Two trains 120m and 180m long run in opposite directions at 54 km/hr "
+            "and 72 km/hr. How long do they take to cross each other?"
+        )
+        result = apply_classification_policy(
+            query,
+            {"subject": "math", "intent": "solve", "difficulty": "intermediate"},
+            classifier_confidence=0.93,
+        )
+        assert result["subject"] == "math"
+
+    def test_regression_age_equation_not_overridden_to_blood_relation(self) -> None:
+        query = (
+            "Nisha is thrice as old as Deepak. Tanya is 5 years younger than Nisha. "
+            "If Deepak is 12 years old, find Tanya's age."
+        )
+        result = apply_classification_policy(
+            query,
+            {"subject": "math", "intent": "solve", "difficulty": "default"},
+            classifier_confidence=0.92,
+        )
+        assert result["subject"] == "math"
+
+    def test_regression_navigation_inference_classifies_reasoning(self) -> None:
+        query = "A person walked 5 km north then turned right and walked 3 km. Where is he now?"
+        result = apply_classification_policy(
+            query,
+            {"subject": "general", "intent": "solve", "difficulty": "default"},
+            classifier_confidence=0.75,
+        )
+        assert result["subject"] == "reasoning"
+
+    def test_regression_pure_relation_inference_classifies_reasoning(self) -> None:
+        query = "How is Amit related to Sunita if Amit is Sunita's mother's brother?"
+        result = apply_classification_policy(
+            query,
+            {"subject": "general", "intent": "explain", "difficulty": "default"},
+            classifier_confidence=0.70,
+        )
+        assert result["subject"] == "reasoning"
+
+    def test_regression_high_confidence_quant_not_overridden_by_broad_words(self) -> None:
+        query = "Trains moving in opposite directions at 60 km/hr and 80 km/hr"
+        result = apply_classification_policy(
+            query,
+            {"subject": "math", "intent": "solve", "difficulty": "intermediate"},
+            classifier_confidence=0.96,
+        )
+        assert result["subject"] == "math"
+
+    def test_regression_father_age_equation_stays_math(self) -> None:
+        query = (
+            "Father is twice as old as daughter. Daughter is 12 years old. "
+            "How old is the father?"
+        )
+        result = apply_classification_policy(
+            query,
+            {"subject": "math", "intent": "solve", "difficulty": "default"},
+            classifier_confidence=0.94,
+        )
+        assert result["subject"] == "math"
+
+
+class TestClassifierThresholdSettings:
+    def test_get_classifier_confidence_threshold_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", raising=False)
+        monkeypatch.delenv("CLASSIFIER_CONFIDENCE_FALLBACK_THRESHOLD", raising=False)
+        _reset_settings()
+        assert get_classifier_confidence_threshold() == 0.93
+
+    def test_get_classifier_confidence_threshold_env_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", "0.88")
+        _reset_settings()
+        assert get_classifier_confidence_threshold() == 0.88
+
+
+class TestPolicyGuardrailBehavior:
+    def test_policy_still_upgrades_advanced_reasoning_pattern(self) -> None:
+        result = apply_classification_policy(
+            "Solve coded inequality with multiple constraints",
+            {"subject": "reasoning", "intent": "explain", "difficulty": "default"},
+            classifier_confidence=0.95,
+        )
+        assert result["difficulty"] == "advanced"
+
+
+class TestClassifierRetrievalHintsSchema:
+    def test_optional_hint_fields_parse(self) -> None:
+        parsed = QueryClassification.model_validate(
+            {
+                "intent": "solve_question",
+                "subject": "math",
+                "topic": "Age Problem",
+                "topic_confidence": 0.91,
+                "pattern_topic_candidate": "AGE",
+                "pattern_family_candidate": None,
+                "retrieval_tags": ["age_equation", "birth_age"],
+                "confidence": 0.92,
+            }
+        )
+        assert parsed.pattern_topic_candidate == "AGE"
+        assert parsed.retrieval_tags == ["age_equation", "birth_age"]
+
+    def test_missing_hint_fields_backward_compatible(self) -> None:
+        parsed = QueryClassification.model_validate(
+            {"intent": "explain_concept", "subject": "english", "confidence": 0.8}
+        )
+        assert parsed.retrieval_tags == []
+        assert parsed.topic_confidence is None
+
+    def test_invalid_topic_confidence_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            QueryClassification.model_validate(
+                {
+                    "intent": "solve_question",
+                    "subject": "math",
+                    "topic_confidence": 1.5,
+                    "confidence": 0.9,
+                }
+            )
+
+    def test_retrieval_tags_normalized_and_capped(self) -> None:
+        parsed = QueryClassification.model_validate(
+            {
+                "intent": "solve_question",
+                "subject": "math",
+                "confidence": 0.9,
+                "retrieval_tags": [
+                    "Train-Crossing",
+                    "train_crossing",
+                    "Ratio Parts",
+                ],
+            }
+        )
+        assert parsed.retrieval_tags == ["train_crossing", "ratio_parts"]
+
+
+class TestClassifierWebSearchSchema:
+    def test_need_web_search_defaults_false(self) -> None:
+        parsed = QueryClassification.model_validate(
+            {"intent": "explain_concept", "subject": "general", "confidence": 0.9}
+        )
+        assert parsed.need_web_search is False
+
+    def test_need_web_search_parses_true(self) -> None:
+        parsed = QueryClassification.model_validate(
+            {
+                "intent": "general_doubt",
+                "subject": "general",
+                "confidence": 0.93,
+                "need_web_search": True,
+                "web_search_reason": "current_affairs",
+                "web_search_query": "latest current affairs UPSC",
+            }
+        )
+        assert parsed.need_web_search is True
+        assert parsed.web_search_reason == "current_affairs"
+        assert parsed.web_search_query == "latest current affairs UPSC"
+
+    def test_web_search_optional_fields(self) -> None:
+        parsed = QueryClassification.model_validate(
+            {
+                "intent": "general_doubt",
+                "subject": "general",
+                "confidence": 0.9,
+                "need_web_search": False,
+            }
+        )
+        assert parsed.web_search_reason is None
+        assert parsed.web_search_query is None
+
+
+class TestClassifierPromptRetrievalHints:
+    def test_prompt_asks_for_topic_and_tags(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "topic_confidence" in prompt
+        assert "retrieval_tags" in prompt
+        assert "pattern_topic_candidate" in prompt
+
+    def test_prompt_canonical_keys_only_when_obvious(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "obvious" in prompt.lower()
+        assert "Do **not** invent obscure keys" in prompt
+
+    def test_prompt_json_only(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "JSON" in prompt
+        assert "chain-of-thought" in prompt.lower()
+
+
+class TestClassifierPromptWebSearch:
+    def test_prompt_instructs_current_affairs_behavior(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "need_web_search" in prompt
+        assert "current affairs" in prompt.lower()
+
+    def test_prompt_says_not_for_static_gk(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "static GK" in prompt or "static GK / general studies" in prompt
+
+    def test_prompt_says_not_for_normal_math_reasoning(self) -> None:
+        prompt = _load_classifier_prompt()
+        lower = prompt.lower()
+        assert "normal **math / quant** problem" in prompt or "math / quant" in lower
+        assert "reasoning" in lower
+
+    def test_prompt_requires_concise_web_search_query(self) -> None:
+        prompt = _load_classifier_prompt()
+        assert "web_search_query" in prompt
+        assert "concise" in prompt.lower()
+
+
+class TestDeterministicRetrievalHints:
+    def test_train_question_produces_tsd_hint(self) -> None:
+        result = _classify_deterministic(
+            "Two trains 120m and 180m cross each other in 10 seconds. Find speed."
+        )
+        assert result.pattern_topic_candidate == "TIME_SPEED_DISTANCE"
+        assert result.retrieval_tags
+
+    def test_coded_inequality_produces_hint(self) -> None:
+        result = _classify_deterministic(
+            "Statements: A > B, B >= C. Which conclusions follow using coded symbols?"
+        )
+        assert result.pattern_topic_candidate == "CODED_INEQUALITY" or result.retrieval_tags
+
+
+JOURNEY_SPEED_QUERY = (
+    "Gopesh starts on his journey at 5 pm. He travels at 40 km/hr for 2 hours. "
+    "Then he increases his speed to 60 km/hr. What is his average speed for the "
+    "whole journey?"
+)
+
+
+class TestDeterministicFallbackHardening:
+    def test_journey_speed_query_math_solve_intermediate(self) -> None:
+        result = _classify_deterministic(JOURNEY_SPEED_QUERY)
+        assert result.subject == "math"
+        assert result.intent == "solve_question"
+        assert result.difficulty == "intermediate"
+        assert result.confidence >= 0.75
+
+    def test_age_equation_math_solve(self) -> None:
+        query = "Father is twice as old as son. Son is 12 years old. Find father's age."
+        result = _classify_deterministic(query)
+        assert result.subject == "math"
+        assert result.intent == "solve_question"
+
+    def test_direction_sense_reasoning_solve(self) -> None:
+        query = "A man walks 5 km north, turns right and walks 3 km. Which direction is he facing?"
+        result = _classify_deterministic(query)
+        assert result.subject == "reasoning"
+        assert result.intent == "solve_question"
+
+    def test_grammar_english(self) -> None:
+        result = _classify_deterministic("Choose the correct grammar form in this sentence.")
+        assert result.subject == "english"
+
+    def test_static_gk_general(self) -> None:
+        result = _classify_deterministic("Who was the first President of India?")
+        assert result.subject in {"unknown", "general"}
+
+
+class TestClassificationSanity:
+    def test_low_confidence_general_numeric_reroutes_math(self) -> None:
+        updated = apply_classification_sanity(
+            JOURNEY_SPEED_QUERY,
+            {"subject": "general", "intent": "explain", "difficulty": "default"},
+            classifier_confidence=0.55,
+        )
+        assert updated["subject"] == "math"
+        assert updated["intent"] == "solve"
+        assert updated["difficulty"] == "intermediate"
+
+    def test_high_confidence_general_unchanged(self) -> None:
+        updated = apply_classification_sanity(
+            "Who was the first President of India?",
+            {"subject": "general", "intent": "explain", "difficulty": "default"},
+            classifier_confidence=0.85,
+        )
+        assert updated["subject"] == "general"
+
+    def test_reasoning_signals_reroute(self) -> None:
+        query = "How is A related to B if A is father of B's sister?"
+        updated = apply_classification_sanity(
+            query,
+            {"subject": "general", "intent": "explain", "difficulty": "default"},
+            classifier_confidence=0.60,
+        )
+        assert updated["subject"] == "reasoning"
+        assert updated["intent"] == "solve"
+
+
+class TestClassifierModelRouting:
+    def test_primary_classifier_uses_safe_gpt_41_mini(self) -> None:
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        reg = LlmConfigRegistry()
+        cfg = reg.model_map["doubt_solver_classifier"]
+        assert cfg.deployment == "gpt-4.1-mini"
+        assert cfg.deployment != "gpt-5.4-mini"
+        route = reg.get_route("general", "classifier", "default")
+        assert route is not None
+        assert route.model == "doubt_solver_classifier"
+
+    def test_strong_classifier_uses_safe_gpt_41(self) -> None:
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        reg = LlmConfigRegistry()
+        cfg = reg.model_map["doubt_solver_classifier_strong"]
+        assert cfg.deployment == "gpt-4.1"
+        assert cfg.deployment != "gpt-5.4"
+        route = reg.get_route("general", "classifier_strong", "default")
+        assert route is not None
+        assert route.model == "doubt_solver_classifier_strong"
+
+    def test_classifier_route_max_tokens(self) -> None:
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+
+        reg = LlmConfigRegistry()
+        primary = reg.get_route("general", "classifier", "default")
+        strong = reg.get_route("general", "classifier_strong", "default")
+        assert primary is not None and primary.max_tokens == 650
+        assert strong is not None and strong.max_tokens == 800

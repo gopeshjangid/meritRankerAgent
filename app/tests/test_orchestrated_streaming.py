@@ -18,7 +18,11 @@ from services.doubt_solver.streaming_doubt_solver_service import (
     StreamDoubtSolverInput,
     stream_doubt_solver,
 )
-from services.llm.orchestration.orchestrator import create_mock_orchestrator_for_tests
+from services.llm.orchestration.orchestrator import (
+    LlmOrchestrator,
+    MockModelExecutor,
+    create_mock_orchestrator_for_tests,
+)
 
 _REQUEST_ID = "test-req-stream-001"
 
@@ -31,6 +35,12 @@ _FORBIDDEN_CONTENT_SUBSTRINGS = {
     "context_text",
     "raw_response",
     "Traceback",
+    "fallback",
+    "confidence",
+    "gpt-",
+    "azure",
+    "deepseek",
+    "classifier_strong",
 }
 
 
@@ -215,13 +225,72 @@ class TestStreamingFlow:
                 assert forbidden not in blob
 
 
+class TestCarefulClassificationStreamStatus:
+    def test_no_extra_status_when_strong_classifier_not_used(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        from schemas.doubt_solver import QueryClassification
+
+        high_conf = QueryClassification(
+            intent="solve_question",
+            subject="math",
+            confidence=0.95,
+            classification_source="llm",
+        )
+        with patch(
+            "graphs.doubt_solver_graph.classify_query",
+            return_value=high_conf,
+        ):
+            events = _collect(_make_adapter("Short answer."))
+        labels = [e.label for e in events if e.type == "status"]
+        assert labels.count("Checking the question more carefully...") == 0
+
+    def test_careful_status_when_strong_classifier_used(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        from schemas.doubt_solver import QueryClassification
+
+        def _classify_with_hook(query, request_id=None, *, on_before_strong_classifier=None):
+            if on_before_strong_classifier is not None:
+                on_before_strong_classifier()
+            return QueryClassification(
+                intent="solve_question",
+                subject="math",
+                confidence=0.94,
+                classification_source="llm",
+            )
+
+        with patch(
+            "graphs.doubt_solver_graph.classify_query",
+            side_effect=_classify_with_hook,
+        ):
+            events = _collect(_make_adapter("Short answer."))
+
+        labels = [e.label for e in events if e.type == "status"]
+        assert "Checking the question more carefully..." in labels
+        careful_idx = labels.index("Checking the question more carefully...")
+        generating_idx = next(
+            i for i, e in enumerate(events) if e.type == "status" and e.stage == "generating"
+        )
+        assert careful_idx < generating_idx
+        assert events[-1].type == "complete"
+
+
 class TestMockProviderStreaming:
-    def test_deterministic_chunks_emitted(self) -> None:
+    def test_deterministic_chunks_emitted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "false")
+        import config as cfg_module
+
+        cfg_module._settings = None
         events = _collect(_make_adapter("12345678901234567890"))
         chunks = [e for e in events if e.type == "chunk"]
         assert len(chunks) >= 2
 
-    def test_collected_chunks_equal_final_answer(self) -> None:
+    def test_collected_chunks_equal_final_answer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "false")
+        import config as cfg_module
+
+        cfg_module._settings = None
         content = "Mock streaming answer for tests."
         events = _collect(_make_adapter(content))
         reconstructed = "".join(e.content or "" for e in events if e.type == "chunk")
@@ -307,6 +376,276 @@ class TestNonStreamRegression:
         )
         assert executor.last_route_decision is not None
         assert executor.last_route_decision.task_role == "generator"
+
+
+class TestStreamingClassificationPolicy:
+    def test_streaming_uses_policy_corrected_subject_and_difficulty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import config as cfg_module
+        from graphs.doubt_solver_graph import _orchestrated_classify_node
+
+        monkeypatch.setenv("ENABLE_REAL_LLM", "false")
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", "{}")
+        cfg_module._settings = None
+
+        state = {
+            "request_id": "stream-policy-1",
+            "query": "Explain profit loss discount trap for SBI PO mains level",
+            "classification": None,
+            "context_text": "",
+            "answer": "",
+        }
+        result = _orchestrated_classify_node(state)
+        classification = result["classification"]
+        assert classification["subject"] == "math"
+        assert classification["difficulty"] == "advanced"
+        cfg_module._settings = None
+
+    def test_streaming_advanced_reasoning_routes_advanced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import config as cfg_module
+        from graphs.doubt_solver_graph import _orchestrated_classify_node
+        from schemas.llm_routing import RouteRequest
+        from services.llm.orchestration.config_registry import LlmConfigRegistry
+        from services.llm.orchestration.route_resolver import resolve_route
+
+        monkeypatch.setenv("ENABLE_REAL_LLM", "false")
+        monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", "{}")
+        cfg_module._settings = None
+
+        state = {
+            "request_id": "stream-route-1",
+            "query": "Explain coded inequality floor puzzle for SBI PO mains level",
+            "classification": None,
+            "context_text": "",
+            "answer": "",
+        }
+        result = _orchestrated_classify_node(state)
+        classification = result["classification"]
+        assert classification["subject"] == "reasoning"
+        assert classification["difficulty"] == "advanced"
+
+        route_decision = resolve_route(
+            RouteRequest(
+                request_id="stream-route-1",
+                subject=classification["subject"],
+                task_role="generator",
+                difficulty=classification["difficulty"],
+            ),
+            registry=LlmConfigRegistry(),
+        )
+        assert route_decision.difficulty == "advanced"
+        assert route_decision.subject == "reasoning"
+        cfg_module._settings = None
+
+
+class TestWebSearchStreamStatus:
+    def test_web_search_emits_recent_information_status(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        from schemas.doubt_solver import QueryClassification
+
+        def _collect_with_web_hook(
+            state,
+            *,
+            on_before_web_search=None,
+            on_web_search_retry=None,
+            on_web_search_weak_context=None,
+        ):
+            if on_before_web_search is not None:
+                on_before_web_search()
+            return {"context_text": "Fresh web context: sample"}
+
+        with patch(
+            "graphs.doubt_solver_graph.classify_query",
+            return_value=QueryClassification(
+                intent="general_doubt",
+                subject="general",
+                confidence=0.95,
+                need_web_search=True,
+                web_search_reason="current_affairs",
+                classification_source="llm",
+            ),
+        ), patch(
+            "services.doubt_solver.streaming_doubt_solver_service._orchestrated_collect_context_node",
+            side_effect=_collect_with_web_hook,
+        ):
+            events = _collect(_make_adapter("Current affairs answer."))
+
+        labels = [e.label for e in events if e.type == "status"]
+        assert "Checking recent information..." in labels
+
+    def test_no_web_status_when_web_not_called(self) -> None:
+        events = _collect(_make_adapter())
+        labels = [e.label for e in events if e.type == "status"]
+        assert "Checking recent information..." not in labels
+
+    def test_no_provider_details_in_web_stream_status(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        from schemas.doubt_solver import QueryClassification
+
+        def _collect_with_web_hook(
+            state,
+            *,
+            on_before_web_search=None,
+            on_web_search_retry=None,
+            on_web_search_weak_context=None,
+        ):
+            if on_before_web_search is not None:
+                on_before_web_search()
+            return {"context_text": ""}
+
+        with patch(
+            "graphs.doubt_solver_graph.classify_query",
+            return_value=QueryClassification(
+                intent="general_doubt",
+                subject="general",
+                confidence=0.95,
+                need_web_search=True,
+                classification_source="llm",
+            ),
+        ), patch(
+            "services.doubt_solver.streaming_doubt_solver_service._orchestrated_collect_context_node",
+            side_effect=_collect_with_web_hook,
+        ):
+            events = _collect(_make_adapter("Answer."))
+
+        for event in events:
+            blob = f"{event.label or ''} {event.content or ''}".lower()
+            assert "tavily" not in blob
+            assert "api" not in blob
+
+
+class TestExtendedStreamStatuses:
+    def test_careful_status_uses_understanding_stage(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        from schemas.doubt_solver import QueryClassification
+
+        def _classify_with_hook(query, request_id=None, *, on_before_strong_classifier=None):
+            if on_before_strong_classifier is not None:
+                on_before_strong_classifier()
+            return QueryClassification(
+                intent="solve_question",
+                subject="math",
+                confidence=0.94,
+                classification_source="llm",
+            )
+
+        with patch(
+            "graphs.doubt_solver_graph.classify_query",
+            side_effect=_classify_with_hook,
+        ):
+            events = _collect(_make_adapter("Short answer."))
+
+        careful = next(
+            e for e in events if e.label == "Checking the question more carefully..."
+        )
+        assert careful.stage == "understanding"
+
+    def test_web_retry_status_at_most_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import config as cfg_module
+        from tools.web_search.models import WebSearchItem, WebSearchRequest
+        from tools.web_search.providers.fake_provider import FakeWebSearchProvider
+        from tools.web_search.web_search_tool import WebSearchTool
+
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "true")
+        monkeypatch.setenv("WEB_SEARCH_RERANK_MIN_SCORE", "0.10")
+        cfg_module._settings = None
+
+        def _collect_with_real_web(
+            state,
+            *,
+            on_before_web_search=None,
+            on_web_search_retry=None,
+            **kwargs,
+        ):
+            if on_before_web_search is not None:
+                on_before_web_search()
+            tool = WebSearchTool(
+                provider=FakeWebSearchProvider(
+                    [
+                        WebSearchItem(
+                            title="Economy CA summary adda",
+                            url="https://adda247.com/ca",
+                            snippet=(
+                                "Exam prep economy current affairs summary "
+                                "with enough content."
+                            ),
+                            source="adda247.com",
+                            score=0.8,
+                        ),
+                    ]
+                )
+            )
+            tool.search(
+                WebSearchRequest(
+                    request_id=state.get("request_id", "x"),
+                    query=state.get("query", ""),
+                    web_search_reason="current_economy",
+                ),
+                on_retry_sources=on_web_search_retry,
+            )
+            return {"context_text": "web context"}
+
+        from unittest.mock import patch
+
+        from schemas.doubt_solver import QueryClassification
+
+        with patch(
+            "graphs.doubt_solver_graph.classify_query",
+            return_value=QueryClassification(
+                intent="general_doubt",
+                subject="general",
+                confidence=0.95,
+                need_web_search=True,
+                web_search_reason="current_economy",
+                classification_source="llm",
+            ),
+        ), patch(
+            "services.doubt_solver.streaming_doubt_solver_service._orchestrated_collect_context_node",
+            side_effect=_collect_with_real_web,
+        ):
+            events = _collect(_make_adapter("Answer."))
+
+        labels = [e.label for e in events if e.type == "status"]
+        assert labels.count("Looking for more reliable sources...") == 1
+        assert "Checking recent information..." in labels
+
+    def test_generator_fallback_status(self) -> None:
+        executor = MockModelExecutor(
+            content="Reliable streamed answer.",
+            notify_fallback_on_stream=True,
+        )
+        orchestrator = LlmOrchestrator(model_executor=executor)
+        adapter = AnswerGenerationAdapter(orchestrator=orchestrator)
+        events = _collect(adapter)
+        labels = [e.label for e in events if e.type == "status"]
+        assert "Preparing a more reliable answer..." in labels
+        assert labels.count("Preparing a more reliable answer...") == 1
+
+    def test_stream_status_no_internal_leakage(self) -> None:
+        executor = MockModelExecutor(
+            content="Answer.",
+            notify_fallback_on_stream=True,
+        )
+        orchestrator = LlmOrchestrator(model_executor=executor)
+        adapter = AnswerGenerationAdapter(orchestrator=orchestrator)
+        events = _collect(adapter)
+        for event in events:
+            blob = f"{event.label or ''} {event.content or ''}".lower()
+            for forbidden in (
+                "fallback",
+                "tavily",
+                "confidence",
+                "classifier",
+                "provider",
+                "threshold",
+            ):
+                assert forbidden not in blob
 
 
 class TestStreamingErrorHandling:

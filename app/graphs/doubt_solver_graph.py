@@ -28,6 +28,7 @@ Public API:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -45,7 +46,11 @@ from services.bedrock_kb_service import (
 )
 from services.context_builder_service import build_doubt_solver_context
 from services.dynamodb_service import DynamoDbConfigurationError, DynamoDbServiceError
-from services.query_classifier_service import classify_query
+from services.query_classifier_service import (
+    apply_classification_policy,
+    apply_classification_sanity,
+    classify_query,
+)
 from services.question_record_service import fetch_question_records_by_ids
 
 logger = logging.getLogger(__name__)
@@ -459,12 +464,16 @@ _ORCHESTRATED_FALLBACK_CLASSIFICATION: dict = {
 }
 
 
-def _map_to_orchestrated_classification(raw: QueryClassification) -> dict:
+def _map_to_orchestrated_classification(
+    raw: QueryClassification,
+    query: str = "",
+    request_id: str = "",
+) -> dict:
     """Map existing QueryClassification output to orchestrated graph classification dict.
 
-    The orchestrated state classification contains only what the generator node needs:
-    subject, intent, difficulty, retrieval_required.  Internal scores, topics,
-    and response_style hints are left outside the orchestrated state.
+    The orchestrated state classification contains generator routing fields plus
+    optional retrieval hints nested in the same classification dict (graph state
+    remains 5 top-level fields).
     """
     from schemas.doubt_solver import DoubtSolverClassification  # noqa: PLC0415
 
@@ -479,8 +488,67 @@ def _map_to_orchestrated_classification(raw: QueryClassification) -> dict:
         intent=intent,
         difficulty=difficulty,
         retrieval_required=retrieval_required,
+        topic=raw.topic,
+        topic_confidence=raw.topic_confidence,
+        pattern_topic_candidate=raw.pattern_topic_candidate,
+        pattern_family_candidate=raw.pattern_family_candidate,
+        retrieval_tags=raw.retrieval_tags,
+        need_web_search=raw.need_web_search,
+        web_search_reason=raw.web_search_reason,
+        web_search_query=raw.web_search_query,
     )
-    return classification.model_dump()
+    classification_dict = classification.model_dump()
+    classification_dict = apply_classification_sanity(
+        query,
+        classification_dict,
+        request_id=request_id,
+        classifier_confidence=raw.confidence,
+    )
+    return apply_classification_policy(
+        query,
+        classification_dict,
+        request_id=request_id,
+        classifier_confidence=raw.confidence,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Node 1: classify
+# ---------------------------------------------------------------------------
+
+
+def orchestrated_classify_query(
+    query: str,
+    request_id: str = "",
+    *,
+    on_before_strong_classifier: Callable[[], None] | None = None,
+) -> dict:
+    """Classify and map to orchestrated graph classification dict.
+
+    Shared by the orchestrated classify graph node and streaming service.
+    """
+    try:
+        raw: QueryClassification = classify_query(
+            query,
+            request_id=request_id or None,
+            on_before_strong_classifier=on_before_strong_classifier,
+        )
+        return _map_to_orchestrated_classification(
+            raw,
+            query=query,
+            request_id=request_id,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "request_id=%s  orchestrated_classify  classifier raised, using fallback",
+            request_id,
+        )
+        classification_dict = _ORCHESTRATED_FALLBACK_CLASSIFICATION.copy()
+        return apply_classification_policy(
+            query,
+            classification_dict,
+            request_id=request_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -500,17 +568,10 @@ def _orchestrated_classify_node(state: OrchestratedDoubtSolverState) -> dict:
     - Call any provider.
     - Use model_id / provider / deployment.
     """
-    try:
-        raw: QueryClassification = classify_query(
-            state["query"], request_id=state.get("request_id")
-        )
-        classification_dict = _map_to_orchestrated_classification(raw)
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "request_id=%s  orchestrated_classify  classifier raised, using fallback",
-            state.get("request_id", ""),
-        )
-        classification_dict = _ORCHESTRATED_FALLBACK_CLASSIFICATION.copy()
+    classification_dict = orchestrated_classify_query(
+        state["query"],
+        request_id=state.get("request_id", ""),
+    )
 
     logger.debug(
         "request_id=%s  orchestrated_classify  subject=%s  intent=%s  difficulty=%s  "
@@ -527,63 +588,67 @@ def _orchestrated_classify_node(state: OrchestratedDoubtSolverState) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _orchestrated_collect_context_node(state: OrchestratedDoubtSolverState) -> dict:
-    """Retrieve context if retrieval_required is True.
+def _orchestrated_collect_context_node(
+    state: OrchestratedDoubtSolverState,
+    *,
+    on_before_web_search: Callable[[], None] | None = None,
+    on_web_search_retry: Callable[[], None] | None = None,
+    on_web_search_weak_context: Callable[[], None] | None = None,
+) -> dict:
+    """Retrieve compact context via ContextRetrievalService.
 
-    Short-circuits to context_text="" when:
-    - classification.retrieval_required is False
-    - ENABLE_KB_RETRIEVAL=false (service no-ops and returns retrieval_source="disabled")
-    - retrieval service raises an error
+    Delegates all KB decision, retrieval, reranking, and formatting to the
+    context retrieval service.  Graph state receives only context_text.
 
-    Does NOT:
-    - Generate any answer.
-    - Construct prompts.
-    - Store raw KB/DynamoDB records in state.
+    On failure: returns context_text="" and continues.
     """
-    classification_dict = state.get("classification") or {}
-    retrieval_required: bool = classification_dict.get("retrieval_required", False)
     query: str = state.get("query", "")
-
-    if not retrieval_required or not query:
+    if not query:
         return {"context_text": ""}
 
-    # Retrieval is requested — delegate to existing service.
-    # The service checks ENABLE_KB_RETRIEVAL itself.
+    classification_dict = state.get("classification") or {}
+
     try:
-        retrieval_response = retrieve_similar_context(query)
+        from services.context_retrieval.context_retrieval_service import (  # noqa: PLC0415
+            ContextRequestBuilder,
+            get_context_retrieval_service,
+        )
 
-        if retrieval_response.retrieval_source == "disabled" or not retrieval_response.results:
-            return {"context_text": ""}
-
-        # Build compact context string — only text content, no raw records in state.
-        from config import get_settings  # noqa: PLC0415
-
-        settings = get_settings()
-        max_chars: int = settings.doubt_solver_max_context_chars
-
-        context_parts: list[str] = []
-        for result in retrieval_response.results:
-            text = (getattr(result, "content", "") or "").strip()
-            if text:
-                context_parts.append(text)
-
-        context_text = "\n\n".join(context_parts)
-        if len(context_text) > max_chars:
-            context_text = context_text[:max_chars]
+        request = ContextRequestBuilder.from_query_and_classification(
+            request_id=state.get("request_id", ""),
+            query=query,
+            classification=classification_dict,
+        )
+        result = get_context_retrieval_service().retrieve_context(
+            request,
+            on_before_web_search=on_before_web_search,
+            on_web_search_retry=on_web_search_retry,
+            on_web_search_weak_context=on_web_search_weak_context,
+        )
+        context_text = result.context_text or ""
 
         logger.debug(
-            "request_id=%s  orchestrated_collect_context  results=%d  context_chars=%d",
+            "request_id=%s  orchestrated_collect_context  items=%d  "
+            "context_chars=%d  reason=%s",
             state.get("request_id", ""),
-            len(retrieval_response.results),
+            result.item_count,
             len(context_text),
+            result.reason,
         )
         return {"context_text": context_text}
 
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "request_id=%s  orchestrated_collect_context  retrieval error,"
-            " continuing without context",
+            "request_id=%s  orchestrated_collect_context  retrieval error  "
+            "error_type=%s  error_message_short=%s  phase=context_retrieve",
             state.get("request_id", ""),
+            type(exc).__name__,
+            str(exc)[:120],
+        )
+        logger.debug(
+            "request_id=%s  orchestrated_collect_context traceback",
+            state.get("request_id", ""),
+            exc_info=True,
         )
         return {"context_text": ""}
 
@@ -646,6 +711,9 @@ def build_orchestrated_doubt_solver_graph(adapter):
                 intent=intent,
                 difficulty=difficulty,
                 context=context_text,
+                web_search_reason=str(classification_dict.get("web_search_reason"))
+                if classification_dict.get("web_search_reason")
+                else None,
             )
         except ProviderExecutionError as exc:
             # Controlled provider failure — all fallbacks exhausted.

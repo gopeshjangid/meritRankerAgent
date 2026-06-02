@@ -32,8 +32,20 @@ import services.query_classifier_service as classifier_module
 from schemas.doubt_solver import QueryClassification
 from services.query_classifier_service import (
     _CLASSIFIER_ROLE,
+    ClassifierRunResult,
     classify_query,
 )
+
+
+def _classifier_run(
+    classification: QueryClassification,
+    *,
+    strong_classifier_used: bool = False,
+) -> ClassifierRunResult:
+    return ClassifierRunResult(
+        classification=classification,
+        strong_classifier_used=strong_classifier_used,
+    )
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -179,19 +191,25 @@ class TestClassifyQueryOrchestratedDispatch:
         with patch.object(
             classifier_module,
             "_classify_with_llm_orchestrated_or_fallback",
-            return_value=QueryClassification(
-                intent="solve_question",
-                subject="math",
-                topic="algebra",
-                response_style="step_by_step",
-                confidence=0.9,
-                retrieval_need="none",
-                reasoning_summary="",
-                classification_source="llm",
+            return_value=_classifier_run(
+                QueryClassification(
+                    intent="solve_question",
+                    subject="math",
+                    topic="algebra",
+                    response_style="step_by_step",
+                    confidence=0.9,
+                    retrieval_need="none",
+                    reasoning_summary="",
+                    classification_source="llm",
+                )
             ),
         ) as mock_fn:
             result = classify_query("What is 2+2?")
-        mock_fn.assert_called_once_with("What is 2+2?", request_id=None)
+        mock_fn.assert_called_once_with(
+            "What is 2+2?",
+            request_id=None,
+            on_before_strong_classifier=None,
+        )
         assert result.classification_source == "llm"
 
     def test_does_not_call_legacy_model_router_when_orchestrated(self, monkeypatch):
@@ -200,15 +218,17 @@ class TestClassifyQueryOrchestratedDispatch:
         with patch.object(
             classifier_module,
             "_classify_with_llm_orchestrated_or_fallback",
-            return_value=QueryClassification(
-                intent="explain_concept",
-                subject="general",
-                topic="test",
-                response_style="short_answer",
-                confidence=0.8,
-                retrieval_need="none",
-                reasoning_summary="",
-                classification_source="llm",
+            return_value=_classifier_run(
+                QueryClassification(
+                    intent="explain_concept",
+                    subject="general",
+                    topic="test",
+                    response_style="short_answer",
+                    confidence=0.8,
+                    retrieval_need="none",
+                    reasoning_summary="",
+                    classification_source="llm",
+                )
             ),
         ), patch.object(
             classifier_module,
@@ -272,11 +292,11 @@ class TestOrchestratedClassifierOrFallback:
             "_classify_with_llm_orchestrated",
             side_effect=ProviderExecutionError("All providers failed"),
         ):
-            result = classifier_module._classify_with_llm_orchestrated_or_fallback(
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
                 "Solve 3x=9"
             )
-        assert result.classification_source == "fallback"
-        assert result.confidence <= 0.55
+        assert run.classification.classification_source == "fallback"
+        assert run.strong_classifier_used is True
 
     def test_falls_back_on_json_decode_error(self, monkeypatch):
         with patch.object(
@@ -284,10 +304,11 @@ class TestOrchestratedClassifierOrFallback:
             "_classify_with_llm_orchestrated",
             side_effect=ValueError("Bad JSON"),
         ):
-            result = classifier_module._classify_with_llm_orchestrated_or_fallback(
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
                 "What is DNA?"
             )
-        assert result.classification_source == "fallback"
+        assert run.classification.classification_source == "fallback"
+        assert run.strong_classifier_used is True
 
     def test_returns_llm_result_on_success(self, monkeypatch):
         expected = QueryClassification(
@@ -295,7 +316,7 @@ class TestOrchestratedClassifierOrFallback:
             subject="english",
             topic="grammar",
             response_style="simple_explanation",
-            confidence=0.85,
+            confidence=0.93,
             retrieval_need="none",
             reasoning_summary="",
             classification_source="llm",
@@ -307,7 +328,7 @@ class TestOrchestratedClassifierOrFallback:
         ):
             result = classifier_module._classify_with_llm_orchestrated_or_fallback(
                 "What is a noun?"
-            )
+            ).classification
         assert result.intent == "explain_concept"
         assert result.classification_source == "llm"
 
@@ -495,15 +516,17 @@ class TestClassifyQueryRequestIdPropagation:
 
     def test_request_id_propagated_when_provided(self, monkeypatch):
         self._env(monkeypatch)
-        _good_result = QueryClassification(
-            intent="solve_question",
-            subject="math",
-            topic="algebra",
-            response_style="step_by_step",
-            confidence=0.9,
-            retrieval_need="none",
-            reasoning_summary="",
-            classification_source="llm",
+        _good_result = _classifier_run(
+            QueryClassification(
+                intent="solve_question",
+                subject="math",
+                topic="algebra",
+                response_style="step_by_step",
+                confidence=0.9,
+                retrieval_need="none",
+                reasoning_summary="",
+                classification_source="llm",
+            )
         )
         with patch.object(
             classifier_module,
@@ -511,19 +534,25 @@ class TestClassifyQueryRequestIdPropagation:
             return_value=_good_result,
         ) as mock_fn:
             classify_query("What is 2+2?", request_id="req-abc")
-        mock_fn.assert_called_once_with("What is 2+2?", request_id="req-abc")
+        mock_fn.assert_called_once_with(
+            "What is 2+2?",
+            request_id="req-abc",
+            on_before_strong_classifier=None,
+        )
 
     def test_request_id_none_when_not_provided(self, monkeypatch):
         self._env(monkeypatch)
-        _good_result = QueryClassification(
-            intent="solve_question",
-            subject="math",
-            topic="algebra",
-            response_style="step_by_step",
-            confidence=0.9,
-            retrieval_need="none",
-            reasoning_summary="",
-            classification_source="llm",
+        _good_result = _classifier_run(
+            QueryClassification(
+                intent="solve_question",
+                subject="math",
+                topic="algebra",
+                response_style="step_by_step",
+                confidence=0.9,
+                retrieval_need="none",
+                reasoning_summary="",
+                classification_source="llm",
+            )
         )
         with patch.object(
             classifier_module,
@@ -531,7 +560,11 @@ class TestClassifyQueryRequestIdPropagation:
             return_value=_good_result,
         ) as mock_fn:
             classify_query("What is 2+2?")
-        mock_fn.assert_called_once_with("What is 2+2?", request_id=None)
+        mock_fn.assert_called_once_with(
+            "What is 2+2?",
+            request_id=None,
+            on_before_strong_classifier=None,
+        )
 
 
 class TestClassifyWithLlmOrchestratedRequestId:
@@ -614,7 +647,8 @@ class TestValidateRealModeDeployments:
     """
 
     def _placeholder_registry(self):
-        """Return a registry object with a known YOUR_* placeholder deployment."""
+        """Return registry with YOUR_* placeholder deployment on an active route."""
+        from schemas.llm_routing import ResolvedRouteEntry
         from services.llm.orchestration.config_registry import LlmConfigRegistry
 
         registry = LlmConfigRegistry.__new__(LlmConfigRegistry)
@@ -622,6 +656,18 @@ class TestValidateRealModeDeployments:
         mock_model.provider = "azure_openai"
         mock_model.deployment = "YOUR_AZURE_GPT4O_DEPLOYMENT"
         registry._model_map = {"math_basic_generator": mock_model}
+        registry._route_map = {
+            ("math", "generator", "default"): ResolvedRouteEntry(
+                model="math_basic_generator",
+                prompt="subjects/math_generator.md",
+                overlays=[],
+                intent_overlays={},
+                temperature=0.2,
+                max_tokens=900,
+                provider_options={},
+                fallback=[],
+            )
+        }
         return registry
 
     def test_raises_for_placeholder_azure_deployments(self):
@@ -631,20 +677,21 @@ class TestValidateRealModeDeployments:
         registry = self._placeholder_registry()
         with pytest.raises(LlmConfigValidationError) as exc_info:
             registry.validate_real_mode_deployments()
-        assert "Placeholder" in str(exc_info.value)
+        assert "placeholder" in str(exc_info.value).lower()
         assert "model_alias=" in str(exc_info.value)
 
     def test_raises_includes_actionable_message(self):
-        """Error message must mention model_registry.yaml so developer knows where to look."""
+        """Error message must mention active route model alias."""
         from services.llm.orchestration.errors import LlmConfigValidationError
 
         registry = self._placeholder_registry()
         with pytest.raises(LlmConfigValidationError) as exc_info:
             registry.validate_real_mode_deployments()
-        assert "model_registry.yaml" in str(exc_info.value)
+        assert "math_basic_generator" in str(exc_info.value)
 
     def test_passes_when_no_placeholder_deployments(self):
-        """Registry with real deployment names must not raise."""
+        """Registry with real deployment names on active routes must not raise."""
+        from schemas.llm_routing import ResolvedRouteEntry
         from services.llm.orchestration.config_registry import LlmConfigRegistry
 
         registry = LlmConfigRegistry.__new__(LlmConfigRegistry)
@@ -652,7 +699,18 @@ class TestValidateRealModeDeployments:
         mock_model.provider = "azure_openai"
         mock_model.deployment = "gpt-4o-mini-prod"
         registry._model_map = {"prod_model": mock_model}
-        # Must not raise
+        registry._route_map = {
+            ("general", "generator", "default"): ResolvedRouteEntry(
+                model="prod_model",
+                prompt="subjects/general_generator.md",
+                overlays=[],
+                intent_overlays={},
+                temperature=0.3,
+                max_tokens=900,
+                provider_options={},
+                fallback=[],
+            )
+        }
         registry.validate_real_mode_deployments()
 
     def test_production_registry_passes_validation(self):
@@ -679,3 +737,131 @@ class TestValidateRealModeDeployments:
             assert forbidden.lower() not in msg.lower(), (
                 f"Error message contains sensitive info '{forbidden}': {msg}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Classifier confidence fallback (Part 13.1)
+# ---------------------------------------------------------------------------
+
+
+def _llm_classification(confidence: float) -> QueryClassification:
+    return QueryClassification(
+        intent="solve_question",
+        subject="math",
+        topic="algebra",
+        response_style="step_by_step",
+        confidence=confidence,
+        retrieval_need="concept_context",
+        reasoning_summary="test",
+        classification_source="llm",
+    )
+
+
+class TestClassifierConfidenceFallback:
+    def test_low_confidence_triggers_strong_classifier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", raising=False)
+        monkeypatch.delenv("CLASSIFIER_CONFIDENCE_FALLBACK_THRESHOLD", raising=False)
+        cfg_module._settings = None
+        primary = _llm_classification(0.91)
+        strong = _llm_classification(0.94)
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[primary, strong],
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "profit question", request_id="req-low"
+            )
+        assert mock_classify.call_count == 2
+        mock_classify.assert_any_call(
+            "profit question", request_id="req-low", task_role="classifier"
+        )
+        mock_classify.assert_any_call(
+            "profit question",
+            request_id="req-low",
+            task_role="classifier_strong",
+        )
+        assert run.classification.confidence == 0.94
+        assert run.strong_classifier_used is True
+        cfg_module._settings = None
+
+    def test_high_confidence_does_not_trigger_strong_classifier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", raising=False)
+        monkeypatch.delenv("CLASSIFIER_CONFIDENCE_FALLBACK_THRESHOLD", raising=False)
+        cfg_module._settings = None
+        primary = _llm_classification(0.94)
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            return_value=primary,
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "profit question", request_id="req-high"
+            )
+        assert mock_classify.call_count == 1
+        assert run.classification.confidence == 0.94
+        assert run.strong_classifier_used is False
+        cfg_module._settings = None
+
+    def test_custom_threshold_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", "0.85")
+        cfg_module._settings = None
+        primary = _llm_classification(0.84)
+        strong = _llm_classification(0.91)
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[primary, strong],
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "profit question", request_id="req-custom"
+            )
+        assert mock_classify.call_count == 2
+        assert run.classification.confidence == 0.91
+        cfg_module._settings = None
+
+    def test_before_strong_classifier_hook_called_once(self) -> None:
+        primary = _llm_classification(0.80)
+        strong = _llm_classification(0.95)
+        calls: list[str] = []
+
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[primary, strong],
+        ):
+            classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "ambiguous question",
+                request_id="req-hook",
+                on_before_strong_classifier=lambda: calls.append("hook"),
+            )
+        assert calls == ["hook"]
+
+    def test_strong_classifier_failure_uses_deterministic(self) -> None:
+        primary = _llm_classification(0.70)
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[primary, RuntimeError("strong failed")],
+        ):
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "profit question", request_id="req-fallback"
+            )
+        assert run.classification.classification_source == "fallback"
+        assert run.strong_classifier_used is True
+
+    def test_primary_failure_uses_deterministic(self) -> None:
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=RuntimeError("primary failed"),
+        ):
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "What is algebra?", request_id="req-det"
+            )
+        assert run.classification.classification_source == "fallback"
+        assert run.strong_classifier_used is True

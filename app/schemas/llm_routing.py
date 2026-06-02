@@ -41,7 +41,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # Pydantic-friendly without extra wrappers)
 # ---------------------------------------------------------------------------
 
-ProviderName = Literal["gemini", "azure_openai", "openai", "mock"]
+ProviderName = Literal["gemini", "azure_openai", "openai", "mock", "deepseek"]
 
 # Azure API mode — determines how the adapter forms the HTTP request.
 # Set in provider_profiles.yaml.  Defaults to azure_deployment_chat_completions
@@ -65,7 +65,13 @@ AzureApiMode = Literal["azure_deployment_chat_completions", "azure_openai_v1"]
 # Other roles are present in the enum for future use — no routes or behavior
 # exists for them in Part 1.
 TaskRole = Literal[
-    "classifier", "planner", "generator", "formatter", "verifier", "visual_formatter"
+    "classifier",
+    "classifier_strong",
+    "planner",
+    "generator",
+    "formatter",
+    "verifier",
+    "visual_formatter",
 ]
 
 DifficultyLevel = Literal["default", "basic", "intermediate", "advanced"]
@@ -430,6 +436,20 @@ class ProviderProfile(BaseModel):
         default=None,
         max_length=256,
         description="AgentCore credential resource name or Secrets Manager ARN reference.",
+    )
+    optional_api_key: bool = Field(
+        default=False,
+        description=(
+            "When true, a missing or blank api_key_env resolves to api_key=None "
+            "instead of raising SecretNotFoundError. Used for optional providers."
+        ),
+    )
+    optional_base_url: bool = Field(
+        default=False,
+        description=(
+            "When true, a missing or blank base_url_env resolves to base_url=None "
+            "instead of raising SecretNotFoundError."
+        ),
     )
 
     model_config = {"str_strip_whitespace": True}

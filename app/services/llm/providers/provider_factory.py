@@ -15,11 +15,10 @@ Supported providers (Part 6):
     mock         → MockProviderAdapter
     openai       → OpenAIProviderAdapter
     azure_openai → AzureOpenAIProviderAdapter
+    gemini       → GeminiProviderAdapter
+    deepseek     → DeepSeekProviderAdapter
 
 Unsupported provider raises LlmProviderConfigurationError.
-
-Deferred:
-- [DEFER] gemini adapter pending dependency/API finalization.
 """
 
 from __future__ import annotations
@@ -64,6 +63,10 @@ class ProviderAdapterFactory:
                 AzureOpenAIProviderAdapter,
             )
             from services.llm.providers.mock_provider import MockProviderAdapter  # noqa: PLC0415
+            from services.llm.providers.openai_compatible_adapter import (  # noqa: PLC0415
+                DeepSeekProviderAdapter,
+                GeminiProviderAdapter,
+            )
             from services.llm.providers.openai_provider import (  # noqa: PLC0415
                 OpenAIProviderAdapter,
             )
@@ -72,6 +75,8 @@ class ProviderAdapterFactory:
                 "mock": MockProviderAdapter(),
                 "openai": OpenAIProviderAdapter(),
                 "azure_openai": AzureOpenAIProviderAdapter(),
+                "gemini": GeminiProviderAdapter(),
+                "deepseek": DeepSeekProviderAdapter(),
             }
 
     def get_provider(self, provider: str) -> ProviderAdapter:

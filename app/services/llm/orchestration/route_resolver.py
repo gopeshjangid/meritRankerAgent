@@ -64,6 +64,9 @@ _SUBJECT_ALIASES: dict[str, str] = {
     "grammar": "english",
     "vocabulary": "english",
     "general": "general",
+    "current_affairs": "current_affairs",
+    "current affairs": "current_affairs",
+    "practice": "practice",
 }
 
 _DIFFICULTY_ALIASES: dict[str, str] = {

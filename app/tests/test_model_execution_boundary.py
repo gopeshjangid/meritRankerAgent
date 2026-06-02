@@ -147,7 +147,7 @@ def _executor_pair(
     *,
     provider_executor: FakeProviderExecutor | None = None,
 ) -> tuple[RegistryBackedModelExecutor, FakeProviderExecutor]:
-    fake = provider_executor or FakeProviderExecutor(content="Boundary answer.")
+    fake = provider_executor or FakeProviderExecutor(content="Boundary answer. <ANSWER_DONE>")
     resolver = ModelConfigResolver(registry=_registry(tmp_path))
     return (
         RegistryBackedModelExecutor(
@@ -163,7 +163,7 @@ def test_fake_provider_executor_records_request_and_call_count(tmp_path: Path) -
 
     result = executor.execute(route_decision=_route_decision(), messages=_messages())
 
-    assert result.content == "Boundary answer."
+    assert result.content == "Boundary answer. <ANSWER_DONE>"
     assert fake.call_count == 1
     assert fake.last_request is not None
 
@@ -363,7 +363,7 @@ def test_provider_execution_request_not_exposed_in_orchestration_result(
         "# Math tutor system prompt.",
         encoding="utf-8",
     )
-    provider = FakeProviderExecutor(content="Final answer.")
+    provider = FakeProviderExecutor(content="Final answer. <ANSWER_DONE>")
     model_executor = RegistryBackedModelExecutor(
         provider_executor=provider,
         model_config_resolver=ModelConfigResolver(registry=registry),
@@ -401,7 +401,7 @@ def test_full_isolated_orchestration_flow_returns_safe_result(tmp_path: Path) ->
         "# Math tutor system prompt.",
         encoding="utf-8",
     )
-    provider = FakeProviderExecutor(content="2 + 2 = 4.")
+    provider = FakeProviderExecutor(content="2 + 2 = 4. <ANSWER_DONE>")
     orchestrator = LlmOrchestrator(
         model_executor=RegistryBackedModelExecutor(
             provider_executor=provider,
@@ -504,7 +504,7 @@ def test_registry_backed_executor_does_not_call_real_provider_without_injection(
     The FakeProviderExecutor is injected — no real OpenAI/Bedrock/Gemini call
     should be made.  Verified by asserting FakeProviderExecutor received the call.
     """
-    fake = FakeProviderExecutor(content="Isolated test response.")
+    fake = FakeProviderExecutor(content="Isolated test response. <ANSWER_DONE>")
     resolver = ModelConfigResolver(registry=_registry(tmp_path))
     executor = RegistryBackedModelExecutor(
         provider_executor=fake,
@@ -514,7 +514,7 @@ def test_registry_backed_executor_does_not_call_real_provider_without_injection(
     result = executor.execute(route_decision=_route_decision(), messages=_messages())
 
     assert fake.call_count == 1, "FakeProviderExecutor must be called exactly once"
-    assert result.content == "Isolated test response."
+    assert result.content == "Isolated test response. <ANSWER_DONE>"
     assert result.provider == "gemini"
 
 

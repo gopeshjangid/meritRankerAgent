@@ -29,6 +29,181 @@ The four V1 planning documents are complete and implementation is done:
 
 ---
 
+## Latest Changes — Part 13.1 Context Retrieval + RAG Correctness Fix
+
+### Summary
+
+Classifier confidence fallback, Bedrock KB context retrieval, and RAG metadata
+correctness for the orchestrated doubt solver path.
+
+1. **Classifier confidence gate** — primary `doubt_solver_classifier`; if confidence
+   < configured threshold (default **0.92**, env `DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD`), one call to `doubt_solver_classifier_strong` (max 2 LLM classifier calls). Streaming emits a student-friendly status ("Checking the question more carefully...") when strong escalation runs.
+2. **Classification policy correction** — `apply_classification_policy()` is a guarded
+   safety net only: method/domain guardrails block superficial keyword overrides;
+   high-confidence primary labels are preserved except for strong explicit pattern signals;
+   difficulty upgrades remain for exam/structural reasoning signals.
+3. **ContextRetrievalService** — graph-facing retrieval boundary with KB subject
+   mapping (math→QUANT), retrieval lanes, deterministic rerank, top-2 selection
+   at `rerank_confidence >= 0.85`, compact pattern context formatting.
+4. **Cache deferred** — no active cache get/set; see `cache_placeholder.py`.
+5. **Bedrock KB retriever** — Retrieve API only; lane-based string metadata filters.
+
+Graph state unchanged: `request_id`, `query`, `classification`, `context_text`, `answer`.
+
+### Classifier retrieval hints + model routing (latest)
+
+- `QueryClassification` optional fields: `topic`, `topic_confidence`, `pattern_topic_candidate`, `pattern_family_candidate`, `retrieval_tags` (nested inside orchestrated `classification` dict — no new graph state fields).
+- `resolve_retrieval_hints()` validates canonical `patternTopicKey` only when `topic_confidence >= CONTEXT_TOPIC_HINT_CONFIDENCE_THRESHOLD` (default **0.85**); otherwise deterministic `derive_pattern_hints()` fallback.
+- Free-text `topic` is **not** used directly as KB metadata filter; `retrieval_tags` / `conceptTags` are rerank signals only.
+- Model aliases (routes reference aliases only): `math_intermediate_generator`, `math_advanced_generator`, `reasoning_basic_generator`, `reasoning_intermediate_generator`, `reasoning_advanced_generator`. Active Azure deployments use known-working names (gpt-4.1 / gpt-4.1-mini); target model names documented in registry descriptions only.
+
+### Classifier reliability + strict JSON (latest)
+
+- Primary classifier: `doubt_solver_classifier` → Azure **`gpt-4.1-mini`** (via `AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI`); strong fallback `doubt_solver_classifier_strong` → **`gpt-4.1`**. Optional GPT-5.4 aliases (`openai_gpt_5_4_mini`, `openai_gpt_5_4`) exist but are inactive until `AZURE_OPENAI_DEPLOYMENT_GPT_5_4*` env vars are set.
+- Confidence threshold for strong escalation: **0.93** (`DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD`).
+- Strict JSON parsing rejects trailing text / multiple objects; invalid primary JSON triggers strong classifier (not deterministic immediately).
+- Answer completion / `<ANSWER_DONE>` / continuation applies **only** to generator routes (`task_role=generator` or `.generator.` in route id).
+- Deterministic fallback hardened for quant motion, age equations, reasoning navigation.
+- `apply_classification_sanity` reroutes low-confidence `general/explain` when strong math/reasoning signals exist.
+
+### Model config precedence (latest)
+
+- **Orchestrated path** (`ENABLE_ORCHESTRATED_DOUBT_SOLVER=true`): YAML `llm_routes.yaml` + `model_registry.yaml` are primary; `LLM_ROLE_CONFIG_JSON` is **ignored**. Logs `model_config_source=yaml`.
+- **Legacy path** (`ENABLE_ORCHESTRATED_DOUBT_SOLVER=false`): `LLM_ROLE_CONFIG_JSON` supplies role → model alias (preferred) or deprecated inline provider config. Aliases validated against registry at startup when `ENABLE_REAL_LLM=true`.
+- Azure deployment names from env: `AZURE_OPENAI_DEPLOYMENT_GPT_4_1`, `_GPT_4_1_MINI`, `_GPT_5_4`, `_GPT_5_4_MINI`, `_GPT_5_5`. Blank GPT-5.x env → optional aliases inactive; active-route preflight fails only for routes referencing blank deployments.
+
+
+- **Not active by default** — production routes remain Azure-first unless YAML explicitly selects a Gemini/DeepSeek alias.
+- Adapters: `GeminiProviderAdapter`, `DeepSeekProviderAdapter` in `app/services/llm/providers/openai_compatible_adapter.py` (OpenAI-compatible HTTP; no new SDK dependency).
+- Registry aliases:
+  - Gemini: `gemini_flash_lite_text`, `gemini_flash_text`, `gemini_image_extractor` (multimodal adapter-level only; `supports_streaming=false`)
+  - DeepSeek: `deepseek_standard_generator`, `deepseek_reasoning_generator`, `deepseek_advanced_generator`
+- Optional test routes (inactive unless selected): `general.generator.gemini_test`, `math.generator.deepseek_test`, `reasoning.generator.deepseek_test`
+- Missing API keys resolve via `optional_api_key` profiles → `provider_not_configured` (fallback-eligible when `fallback_models` configured).
+- Safety blocks map to `safety_blocked` (not fallback-eligible).
+
+Env (optional — app starts without keys):
+- `GEMINI_API_KEY`, `GEMINI_BASE_URL`, `GEMINI_TIMEOUT_SECONDS`, `GEMINI_DEFAULT_MODEL`, `GEMINI_IMAGE_MODEL`, `GEMINI_TEXT_MODEL`
+- `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_TIMEOUT_SECONDS`, `DEEPSEEK_DEFAULT_MODEL`, `DEEPSEEK_REASONER_MODEL`, `DEEPSEEK_ADVANCED_MODEL`
+- `AZURE_OPENAI_DEPLOYMENT_GPT_4_1`, `AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI`, `AZURE_OPENAI_DEPLOYMENT_GPT_5_4`, `AZURE_OPENAI_DEPLOYMENT_GPT_5_4_MINI`, `AZURE_OPENAI_DEPLOYMENT_GPT_5_5`
+- `LLM_ENABLE_GEMINI_ROUTES=false`, `LLM_ENABLE_DEEPSEEK_ROUTES=false` (documentation flags; routes exist in YAML but are not production defaults)
+
+To test: set provider API key in `.env.local`, point a route `model:` field to a Gemini/DeepSeek alias (or invoke a `*_test` route).
+
+Config:
+- `CONTEXT_TOPIC_HINT_CONFIDENCE_THRESHOLD=0.85`
+- `CONTEXT_MAX_RETRIEVAL_TAGS=10`
+
+### Conditional web search (latest)
+
+- Classifier optional fields (nested in orchestrated `classification` dict — graph state unchanged): `need_web_search`, `web_search_reason`, `web_search_query`.
+- **Provider-agnostic web search subsystem** under `app/tools/web_search/`:
+  - `WebSearchTool.search()` — sole entry point for context retrieval
+  - `WebSourcePolicyResolver` — selects YAML source pack + freshness window
+  - `WebSearchQueryBuilder` — builds provider-neutral requests per attempt
+  - `WebSearchReranker` — source-quality gate (trusted/reputed/generic)
+  - `WebContextFormatter` — compact `[Web Context]` for generator
+  - `source_packs.yaml` — trusted/reputed/blocked domains (not hardcoded in Python)
+  - `TavilyWebSearchProvider` — isolated adapter; `include_raw_content=false` by default
+- Progressive attempts: authoritative → authoritative_plus_reputed → exam_prep (if enabled) → generic (if enabled)
+- Source quality tiers: trusted / reputed / exam_prep / generic / blocked
+- Exam-prep fallback (`WEB_SEARCH_ALLOW_EXAM_PREP_FALLBACK=true`) for summary current affairs only; official exam/notification queries require official sources (`WEB_SEARCH_REQUIRE_OFFICIAL_FOR_EXAM_UPDATES=true`)
+- Starter source packs in `source_packs.yaml` include trusted/reputed/exam_prep tiers plus `international_current_affairs`; expand gradually from logs
+- **Scope-aware routing:** default current affairs uses mixed India 70% / world 30%; explicit India or world/global signals shift weights to 100%; exam names are audience context only — lifecycle intent routes to exam updates
+- Streaming status labels (student-facing, deduped per request): `"Checking the question more carefully..."`, `"Checking recent information..."`, `"Looking for more reliable sources..."`, `"Reliable recent sources were limited, answering carefully..."`, `"Preparing a more reliable answer..."`
+### Generator answer budget + completion (latest)
+
+- Route-level `max_tokens` in `llm_routes.yaml` is the hard output token budget (documented as max_output_tokens).
+- Budgets: math basic 900 / intermediate 1500 / advanced 2600; reasoning basic 1000 / intermediate 1800 / advanced 3200; english default 1000; general default 900 / intermediate 1400 / advanced 2200; `current_affairs.generator.default` 1800; `practice.generator.default` 2600.
+- `generator_answer_contract.md` appended to all generator prompts — valid Markdown, `\(...\)` / `\[...\]` math only (no `$`/`$$`), no HTML/JSX/chart code, visuals deferred.
+- `AnswerCompletionPolicy`: continuation only when `finish_reason=length` OR marker missing **and** final answer incomplete; marker missing with final answer present does not continue.
+- `answer_quality.py`: deterministic validation (math delimiters, bad phrases, verbosity, duplicate final answer) + one bounded rewrite (700 tokens intermediate) on failure.
+- Env: `ANSWER_QUALITY_VALIDATION_ENABLED`, `ANSWER_QUALITY_REWRITE_ENABLED`, `ANSWER_QUALITY_MATH_INTERMEDIATE_MAX_CHARS=2200`, `ANSWER_QUALITY_MAX_REWRITE_ATTEMPTS=1`.
+- Logs: `answer_generation_budget`, `answer_completion`, `answer_quality_validation`, `answer_quality_rewrite` (no full answer/prompt).
+- Stream path buffers when validation enabled, then yields finalized text (event contract unchanged).
+
+### KB context formatting fallback (latest)
+
+- `SolutionBriefBuilder` uses safe metadata helpers (`safe_str`, `safe_list`, `normalize_metadata_key`) so optional/sparse KB metadata never drops selected context.
+- `_extract_given()` splits conditional clauses with case-insensitive `\sif\s` matching so mixed-case `If` in student queries does not raise `IndexError`.
+- If `SolutionBriefBuilder` fails after KB selection (`selected_count > 0`), `ContextRetrievalService` falls back to compact `[Relevant KB Context]` text (no pattern IDs, scores, or raw JSON).
+- Logs: `solution_brief_builder_used=true` on success; `solution_brief_failed=true` + `fallback_context_used=true` + `final_context_chars>0` on fallback.
+- Graph node logs safe `error_type` / `phase=context_retrieve` only when retrieval raises before service fallback applies.
+
+- Extract deferred (`WEB_SEARCH_ENABLE_EXTRACT=false`)
+
+Web search env (disabled by default):
+- `WEB_SEARCH_ENABLED=false`
+- `WEB_SEARCH_PROVIDER=tavily`
+- `TAVILY_API_KEY=`
+- `WEB_SEARCH_SOURCE_STRICTNESS=authoritative_first`
+- `WEB_SEARCH_ALLOW_GENERIC_FALLBACK=false`
+- `WEB_SEARCH_ALLOW_EXAM_PREP_FALLBACK=true`
+- `WEB_SEARCH_EXAM_PREP_MAX_SELECTED_RESULTS=2`
+- `WEB_SEARCH_REQUIRE_OFFICIAL_FOR_EXAM_UPDATES=true`
+- `WEB_SEARCH_REQUIRE_TRUSTED_FOR_CURRENT_AFFAIRS=true`
+- `WEB_SEARCH_MIN_TRUSTED_RESULTS=1`
+- `WEB_SEARCH_DEFAULT_RECENT_DAYS=30`
+- `WEB_SEARCH_SEARCH_DEPTH=basic`
+- `WEB_SEARCH_MAX_SELECTED_RESULTS=3`
+- `WEB_SEARCH_RERANK_MIN_SCORE=0.65`
+- `WEB_SEARCH_ENABLE_EXTRACT=false`
+
+### KB metadata rules
+
+| App subject | KB `subject` filter |
+|---|---|
+| math/quant/quantitative | QUANT |
+| reasoning | REASONING |
+| english | ENGLISH |
+| general/gk | GK |
+
+Strict filters: `subject`, `patternTopicKey`, `patternFamilyKey`, `schemaVersion`,
+`taxonomyReviewRequired` (all string values). **Not** strict: `complexityLevel`,
+`confidence`, app `difficulty`, `conceptTags`.
+
+Retrieval lanes: SUBJECT_TOPIC_FAMILY → SUBJECT_TOPIC → SUBJECT_ONLY → RELAXED_SUBJECT_ONLY → BROAD_SEMANTIC (max 5). Strict production filters on lanes 1–3; relaxed same-subject before broad semantic.
+
+### RAG hardening (pre-smoke-test)
+
+- Bedrock normalizer supports `content.text`, string content, top-level `text`, nested metadata
+- Missing KB metadata downranked (not hard-rejected) except explicit mismatches
+- Deterministic `derive_pattern_hints()` for topic/pattern extraction from query text
+- Structural difficulty policy (reasoning pattern topics, multi-constraint queries)
+- Subject/difficulty policy correction (profit→math, coded inequality→reasoning, SBI PO→advanced)
+- Rerank breakdown diagnostics for top 3 candidates + `near_miss` flag (0.70–0.85)
+- Human-readable summary logs: `context_retrieval_summary`, `context_rerank_summary`, `classification_policy_summary`
+- Lane logs include skip counters and Bedrock score stats (verbose key samples at DEBUG)
+- Below-threshold rerank diagnostics in logs (no query/chunk text)
+
+### Files added
+
+| File | Notes |
+|---|---|
+| `app/services/context_retrieval/context_models.py` | Request/result/decision models |
+| `app/services/context_retrieval/cache_placeholder.py` | Future cache notes (no runtime) |
+| `app/services/context_retrieval/bedrock_kb_retriever.py` | Bedrock Retrieve adapter + lanes |
+| `app/services/context_retrieval/context_retrieval_service.py` | Decision, lanes, rerank, format |
+| `app/tests/test_context_retrieval_service.py` | Mapping, lanes, rerank, formatter tests |
+| `app/tests/test_bedrock_kb_retriever.py` | Fake-client retriever tests |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `app/services/query_classifier_service.py` | Strong classifier fallback + policy correction |
+| `app/graphs/doubt_solver_graph.py` | Policy in classify map; collect_context via service |
+| `app/config.py` | `CONTEXT_KB_SCHEMA_VERSION`, `CONTEXT_KB_TAXONOMY_APPROVED_ONLY` |
+
+### Deferred
+
+- Model reranker (`ENABLE_CONTEXT_MODEL_RERANKER`)
+- Exact pattern verifier / semantic matcher
+- Active cache (Redis/ElastiCache/in-memory get/set)
+- DynamoDB indexed retrieval, web search, planner, validator, memory
+
+---
+
 ## Latest Changes — Orchestrated Student-Friendly Streaming
 
 ### Summary
@@ -1244,7 +1419,8 @@ ENABLE_KB_RETRIEVAL=false (default)
 ENABLE_KB_RETRIEVAL=true + BEDROCK_KB_ID set
     → calls bedrock-agent-runtime:Retrieve (NOT retrieve_and_generate)
     → parses results into List[KnowledgeBaseResult]
-    → applies optional BEDROCK_KB_MIN_SCORE filter
+    → (legacy bedrock_kb_service only) optional BEDROCK_KB_MIN_SCORE filter
+    → context_retrieval path: Bedrock score preserved for rerank only, not pre-normalization filter
     → returns RetrievalResponse(retrieval_source="bedrock_kb")
 
 ENABLE_KB_RETRIEVAL=true + BEDROCK_KB_ID missing
@@ -1266,7 +1442,7 @@ ENABLE_KB_RETRIEVAL=true + BEDROCK_KB_ID missing
 | `BEDROCK_KB_ID` | `""` | Knowledge Base ID (required when enabled) |
 | `BEDROCK_KB_REGION` | `""` (uses `AWS_REGION` or boto3 default) | Override region for KB client |
 | `BEDROCK_KB_MAX_RESULTS` | `5` | Default number of results to request |
-| `BEDROCK_KB_MIN_SCORE` | (none) | Minimum similarity score filter (float, optional) |
+| `BEDROCK_KB_MIN_SCORE` | (none) | Legacy min score for `bedrock_kb_service` only; context_retrieval normalizer does not hard-filter on score |
 
 ### Test summary (Part 7 additions)
 

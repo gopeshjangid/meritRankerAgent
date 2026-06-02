@@ -285,7 +285,12 @@ class LlmConfigRegistry:
         provider_profiles: dict[str, ProviderProfile],
     ) -> None:
         """Resolve inheritance, compile maps, and cross-validate."""
+        from services.llm.orchestration.model_registry_env import (  # noqa: PLC0415
+            apply_model_registry_env_overrides,
+        )
+
         self._model_map = dict(models)
+        apply_model_registry_env_overrides(self._model_map)
         self._provider_profile_map = dict(provider_profiles)
         self._build_route_map(routes)
         self._cross_validate()
@@ -594,58 +599,58 @@ class LlmConfigRegistry:
                         dep,
                     )
 
+    def _active_route_model_aliases(self) -> set[str]:
+        """Model aliases referenced by compiled routes (primary models only)."""
+        return {route.model for route in self._route_map.values()}
+
     def validate_real_mode_deployments(self) -> None:
-        """Raise LlmConfigValidationError if any model has a placeholder deployment.
+        """Raise if any *active-route* Azure model has empty/placeholder deployment.
 
-        Call this method only when ENABLE_REAL_LLM=true.  In mock/local mode
-        placeholders are allowed (service must remain startable for development).
+        Only models referenced by llm_routes.yaml are checked. Optional catalog
+        aliases (e.g. openai_gpt_5_4 when env unset) may remain inactive with
+        blank deployments without blocking startup.
 
-        Checks:
-        - azure_openai models: deployment must be set and must not be a placeholder.
-        - openai models: model_id must be set and must not be a placeholder.
-
-        Security: error messages include only the model alias and deployment name
-        (safe config values).  No API keys, endpoint values, prompts, queries,
-        or context are included.
-
-        Raises:
-            LlmConfigValidationError: With a safe, actionable message listing
-                every alias that has a placeholder value.
+        Security: error messages include only model alias and deployment name.
         """
         errors: list[str] = []
+        active_aliases = self._active_route_model_aliases()
 
-        for alias, model_cfg in self._model_map.items():
+        for alias in sorted(active_aliases):
+            model_cfg = self._model_map.get(alias)
+            if model_cfg is None:
+                continue
             if model_cfg.provider == "azure_openai":
                 dep = getattr(model_cfg, "deployment", None) or ""
                 if not dep:
                     errors.append(
-                        f"Placeholder Azure deployment found for "
-                        f"model_alias='{alias}': deployment is empty. "
-                        "Set a real deployment name in app/config/llm/model_registry.yaml."
+                        f"Active route model_alias='{alias}' has empty Azure "
+                        "deployment. Set the matching AZURE_OPENAI_DEPLOYMENT_* "
+                        "env var or point the route to a working alias."
                     )
-                elif any(dep.upper().startswith(p) or p in dep.upper()
-                         for p in self._PLACEHOLDER_PREFIXES):
+                elif any(
+                    dep.upper().startswith(p) or p in dep.upper()
+                    for p in self._PLACEHOLDER_PREFIXES
+                ):
                     errors.append(
-                        f"Placeholder Azure deployment found for "
-                        f"model_alias='{alias}'. "
-                        "Replace deployment in app/config/llm/model_registry.yaml."
+                        f"Active route model_alias='{alias}' has placeholder "
+                        "Azure deployment. Replace with a real deployment name."
                     )
             elif model_cfg.provider == "openai":
                 mid = getattr(model_cfg, "model_id", None) or ""
-                if any(mid.upper().startswith(p) or p in mid.upper()
-                       for p in self._PLACEHOLDER_PREFIXES):
+                if any(
+                    mid.upper().startswith(p) or p in mid.upper()
+                    for p in self._PLACEHOLDER_PREFIXES
+                ):
                     errors.append(
-                        f"Placeholder model_id found for "
-                        f"model_alias='{alias}'. "
-                        "Replace model_id in app/config/llm/model_registry.yaml."
+                        f"Active route model_alias='{alias}' has placeholder "
+                        "model_id. Replace in model_registry.yaml."
                     )
 
         if errors:
             raise LlmConfigValidationError(
-                "Real-mode deployment preflight failed — placeholder deployment "
-                "names are present. Set ENABLE_REAL_LLM=false for local/mock "
-                "operation, or replace all placeholder values before going live. "
-                "Affected models: " + "; ".join(errors)
+                "Real-mode deployment preflight failed for active routes. "
+                "Set ENABLE_REAL_LLM=false for local/mock operation, or configure "
+                "deployments before going live. Affected: " + "; ".join(errors)
             )
 
 

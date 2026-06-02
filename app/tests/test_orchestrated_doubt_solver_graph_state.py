@@ -258,20 +258,24 @@ class TestDoubtSolverClassification:
         clf = DoubtSolverClassification(retrieval_required=True)
         assert clf.retrieval_required is True
 
-    def test_model_dump_has_four_fields(self) -> None:
+    def test_model_dump_includes_core_and_optional_hint_fields(self) -> None:
         clf = DoubtSolverClassification()
         dumped = clf.model_dump()
-        assert set(dumped.keys()) == {"subject", "intent", "difficulty", "retrieval_required"}
+        assert {"subject", "intent", "difficulty", "retrieval_required"}.issubset(
+            set(dumped.keys())
+        )
+        assert "topic" in dumped
+        assert "retrieval_tags" in dumped
 
     def test_no_confidence_field(self) -> None:
         clf = DoubtSolverClassification()
         dumped = clf.model_dump()
         assert "confidence" not in dumped
 
-    def test_no_topic_field(self) -> None:
-        clf = DoubtSolverClassification()
+    def test_topic_field_optional(self) -> None:
+        clf = DoubtSolverClassification(topic="Age Problem")
         dumped = clf.model_dump()
-        assert "topic" not in dumped
+        assert dumped["topic"] == "Age Problem"
 
     def test_no_response_style_field(self) -> None:
         clf = DoubtSolverClassification()

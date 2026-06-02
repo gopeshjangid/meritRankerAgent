@@ -19,6 +19,9 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from schemas.doubt_solver import QueryClassification
 
@@ -29,6 +32,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _CLASSIFIER_ROLE = "doubt_solver_classifier"
+_CLASSIFIER_STRONG_TASK_ROLE = "classifier_strong"
+
+
+@dataclass(frozen=True)
+class ClassifierRunResult:
+    """Classifier output plus whether strong-model escalation ran."""
+
+    classification: QueryClassification
+    strong_classifier_used: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Lazy orchestrator singleton — orchestrated path
@@ -152,6 +165,316 @@ _DIFFICULTY_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
+_POLICY_ADVANCED_SIGNALS: tuple[str, ...] = (
+    "advanced",
+    "sbi po",
+    "ibps po",
+    "banking exam level",
+    "bank exam",
+    "mains level",
+    "cat level",
+    "upsc level",
+    "hard",
+    "tricky",
+    "tough",
+    "high level",
+    "puzzle",
+    "seating arrangement",
+    "floor puzzle",
+    "coded inequality",
+    "caselet",
+)
+
+_POLICY_BASIC_SIGNALS: tuple[str, ...] = (
+    "basic",
+    "beginner",
+    "easy",
+    "simple explanation",
+)
+
+_POLICY_MATH_SIGNALS: tuple[str, ...] = (
+    "profit",
+    "loss",
+    "discount",
+    "marked price",
+    "selling price",
+    "cost price",
+    "percentage",
+    "ratio",
+    "average",
+    "mixture",
+    "alligation",
+    "time and work",
+    "time speed distance",
+    "train",
+    "boat",
+    "simple interest",
+    "compound interest",
+    "partnership",
+    "mensuration",
+    "algebra",
+    "quadratic",
+    "number system",
+)
+
+_POLICY_REASONING_SIGNALS: tuple[str, ...] = (
+    "seating arrangement",
+    "floor puzzle",
+    "coded inequality",
+    "direction sense",
+    "blood relation",
+    "related to",
+    "syllogism",
+    "puzzle",
+    "arrangement",
+    "coding decoding",
+    "input output",
+    "series",
+    "analogy",
+    "turned right",
+    "turned left",
+    "turns right",
+    "turns left",
+    "facing north",
+    "facing south",
+)
+
+_POLICY_ENGLISH_SIGNALS: tuple[str, ...] = (
+    "grammar",
+    "synonym",
+    "antonym",
+    "sentence correction",
+    "fill in the blank",
+    "cloze test",
+    "reading comprehension",
+    "para jumble",
+)
+
+_MATH_TSD_METHOD_SIGNALS: tuple[str, ...] = (
+    "km/hr",
+    "km/h",
+    "kmph",
+    "m/s",
+    "relative speed",
+    "time speed distance",
+    "speed of",
+    "crosses",
+    "crossing",
+)
+
+_QUANT_MOTION_CONTEXT_SIGNALS: tuple[str, ...] = (
+    "train",
+    "trains",
+    "boat",
+    "length",
+    "distance",
+    "hour",
+    "metre",
+    "meter",
+    "km",
+    "opposite direction",
+    "opposite directions",
+)
+
+_AGE_EQUATION_METHOD_SIGNALS: tuple[str, ...] = (
+    "years old",
+    "year old",
+    "older than",
+    "younger than",
+    "thrice",
+    "birth",
+    "currently",
+    "age of",
+    "age is",
+    "age was",
+)
+
+_FAMILY_CONTEXT_TERMS: tuple[str, ...] = (
+    "father",
+    "mother",
+    "daughter",
+    "son",
+    "sister",
+    "brother",
+)
+
+_BROAD_REASONING_SUBJECT_SIGNALS: frozenset[str] = frozenset(
+    {"direction sense", "related to", "father", "mother", "daughter", "son", "sister", "brother"}
+)
+
+
+_STRONG_EXPLICIT_REASONING_SIGNALS: frozenset[str] = frozenset(
+    {
+        "coded inequality",
+        "seating arrangement",
+        "floor puzzle",
+        "blood relation",
+        "direction sense",
+        "syllogism",
+        "coding decoding",
+        "input output",
+        "caselet",
+    }
+)
+
+
+def get_classifier_confidence_threshold() -> float:
+    """Return configured primary-classifier confidence threshold for strong fallback."""
+    from config import get_settings  # noqa: PLC0415
+
+    return get_settings().classifier_confidence_fallback_threshold
+
+
+_SANITY_LOW_CONFIDENCE_THRESHOLD = 0.70
+
+
+def _classifier_conflicts_with_signals(query: str, classification: QueryClassification) -> bool:
+    """True when LLM labels conflict with strong deterministic subject signals."""
+    query_lower = query.lower()
+    if classification.confidence >= get_classifier_confidence_threshold():
+        return False
+    if _requires_quantitative_solving_method(query_lower) and classification.subject in {
+        "general",
+        "unknown",
+        "reasoning",
+    }:
+        return True
+    if classification.intent in {"explain_concept", "general_doubt"} and (
+        _requires_quantitative_solving_method(query_lower)
+        or _requires_logical_inference_method(query_lower)
+    ):
+        return True
+    if _requires_logical_inference_method(query_lower) and classification.subject in {
+        "general",
+        "unknown",
+    }:
+        return True
+    return False
+
+
+def _log_classifier_primary_result(
+    classification: QueryClassification,
+    *,
+    valid_json: bool,
+    route_id: str,
+) -> None:
+    logger.info(
+        "classifier_primary_result  route_id=%s  valid_json=%s  confidence=%.2f  "
+        "subject=%s  intent=%s  difficulty=%s",
+        route_id,
+        str(valid_json).lower(),
+        classification.confidence,
+        classification.subject,
+        classification.intent,
+        classification.difficulty,
+    )
+
+
+def _log_classifier_json_error(exc: BaseException, *, route_id: str) -> None:
+    from services.doubt_solver.classifier_json import ClassifierJsonError  # noqa: PLC0415
+
+    if isinstance(exc, ClassifierJsonError):
+        error_type = exc.error_type
+        message_short = exc.message[:120]
+    else:
+        error_type = type(exc).__name__
+        message_short = type(exc).__name__
+    logger.warning(
+        "classifier_json_error  route_id=%s  error_type=%s  error_message_short=%s",
+        route_id,
+        error_type,
+        message_short,
+    )
+
+
+def _log_classifier_fallback_decision(
+    *,
+    request_id: str,
+    reason: str,
+    fallback_used: bool,
+    strong_classifier_used: bool,
+) -> None:
+    logger.info(
+        "classifier_fallback_decision  request_id=%s  reason=%s  "
+        "fallback_used=%s  strong_classifier_used=%s",
+        request_id,
+        reason,
+        str(fallback_used).lower(),
+        str(strong_classifier_used).lower(),
+    )
+
+
+def apply_classification_sanity(
+    query: str,
+    classification: dict[str, Any],
+    *,
+    request_id: str = "",
+    classifier_confidence: float | None = None,
+) -> dict[str, Any]:
+    """Reroute low-confidence general/explain when strong subject signals exist."""
+    old_subject = str(classification.get("subject") or "general")
+    old_intent = str(classification.get("intent") or "explain")
+    confidence = (
+        classifier_confidence
+        if classifier_confidence is not None
+        else _SANITY_LOW_CONFIDENCE_THRESHOLD
+    )
+    query_lower = query.lower()
+
+    should_check = (
+        old_subject == "general"
+        and old_intent == "explain"
+        and confidence < _SANITY_LOW_CONFIDENCE_THRESHOLD
+    )
+    if not should_check:
+        logger.info(
+            "classification_sanity  request_id=%s  applied=false  old_subject=%s  "
+            "new_subject=%s  reason=none",
+            request_id,
+            old_subject,
+            old_subject,
+        )
+        return classification
+
+    new_subject = old_subject
+    new_intent = old_intent
+    reason = ""
+    if _requires_quantitative_solving_method(query_lower) or _detect_policy_subject(
+        query_lower
+    ) == "math":
+        new_subject = "math"
+        new_intent = "solve"
+        reason = "route_sanity_math_signal"
+    elif _requires_logical_inference_method(query_lower) or _detect_policy_subject(
+        query_lower
+    ) == "reasoning":
+        new_subject = "reasoning"
+        new_intent = "solve"
+        reason = "route_sanity_reasoning_signal"
+
+    applied = new_subject != old_subject or new_intent != old_intent
+    logger.info(
+        "classification_sanity  request_id=%s  applied=%s  old_subject=%s  "
+        "new_subject=%s  reason=%s",
+        request_id,
+        str(applied).lower(),
+        old_subject,
+        new_subject if applied else old_subject,
+        reason if applied else "none",
+    )
+    if not applied:
+        return classification
+
+    updated = dict(classification)
+    updated["subject"] = new_subject
+    updated["intent"] = new_intent
+    if new_subject == "math" and str(updated.get("difficulty") or "default") in {
+        "default",
+        "basic",
+    }:
+        updated["difficulty"] = "intermediate"
+    return updated
+
 
 # ---------------------------------------------------------------------------
 # Deterministic helpers
@@ -201,18 +524,449 @@ def _detect_difficulty(query_lower: str) -> str:
     return "default"
 
 
+def _query_has_advanced_signal(query_lower: str) -> bool:
+    return any(signal in query_lower for signal in _POLICY_ADVANCED_SIGNALS)
+
+
+def _query_has_basic_signal(query_lower: str) -> bool:
+    return any(signal in query_lower for signal in _POLICY_BASIC_SIGNALS)
+
+
+def _detect_policy_subject(query_lower: str) -> str | None:
+    """Return subject for the strongest explicit signal match, if any."""
+    best_len = 0
+    best_subject: str | None = None
+    for subject, signals in (
+        ("reasoning", _POLICY_REASONING_SIGNALS),
+        ("math", _POLICY_MATH_SIGNALS),
+        ("english", _POLICY_ENGLISH_SIGNALS),
+    ):
+        for signal in signals:
+            if signal in query_lower and len(signal) > best_len:
+                best_len = len(signal)
+                best_subject = subject
+    return best_subject
+
+
+def _find_matched_signal(query_lower: str, signals: tuple[str, ...]) -> str | None:
+    best: str | None = None
+    for signal in signals:
+        if signal in query_lower and (best is None or len(signal) > len(best)):
+            best = signal
+    return best
+
+
+def _requires_quantitative_solving_method(query_lower: str) -> bool:
+    """True when solving requires numeric/formula work — guardrail for policy overrides."""
+    tsd_rate_hits = sum(1 for signal in _MATH_TSD_METHOD_SIGNALS if signal in query_lower)
+    motion_context = sum(
+        1 for signal in _QUANT_MOTION_CONTEXT_SIGNALS if signal in query_lower
+    )
+    if tsd_rate_hits >= 1 and motion_context >= 1:
+        return True
+    if tsd_rate_hits >= 2:
+        return True
+
+    age_hits = sum(1 for signal in _AGE_EQUATION_METHOD_SIGNALS if signal in query_lower)
+    if age_hits >= 2:
+        return True
+    if age_hits >= 1 and (
+        "age" in query_lower
+        or any(term in query_lower for term in _FAMILY_CONTEXT_TERMS)
+    ):
+        return True
+    return False
+
+
+def _requires_logical_inference_method(query_lower: str) -> bool:
+    """True when solving is primarily inference/navigation, not numeric calculation."""
+    if _requires_quantitative_solving_method(query_lower):
+        return False
+    inference_markers = (
+        "how is",
+        "related to",
+        "facing north",
+        "facing south",
+        "turned right",
+        "turned left",
+        "turns right",
+        "turns left",
+        "statements",
+        "conclusions",
+        "all some",
+        "coded inequality",
+        "seating arrangement",
+        "floor puzzle",
+    )
+    return any(marker in query_lower for marker in inference_markers)
+
+
+def _should_apply_subject_correction(
+    query_lower: str,
+    old_subject: str,
+    detected_subject: str,
+    *,
+    classifier_confidence: float | None,
+) -> bool:
+    """Guard subject overrides — policy is safety net, not primary classifier."""
+    if detected_subject == old_subject:
+        return False
+
+    threshold = get_classifier_confidence_threshold()
+    matched = _find_matched_signal(
+        query_lower,
+        _POLICY_REASONING_SIGNALS + _POLICY_MATH_SIGNALS + _POLICY_ENGLISH_SIGNALS,
+    )
+
+    if detected_subject == "reasoning" and _requires_quantitative_solving_method(query_lower):
+        return False
+
+    if (
+        old_subject == "math"
+        and detected_subject == "reasoning"
+        and _requires_quantitative_solving_method(query_lower)
+    ):
+        return False
+
+    if (
+        classifier_confidence is not None
+        and classifier_confidence >= threshold
+        and old_subject not in {"general", "unknown"}
+    ):
+        if matched in _STRONG_EXPLICIT_REASONING_SIGNALS and detected_subject == "reasoning":
+            return True
+        if matched in _POLICY_MATH_SIGNALS and detected_subject == "math":
+            return True
+        if matched in _POLICY_ENGLISH_SIGNALS and detected_subject == "english":
+            return True
+        return False
+
+    if (
+        detected_subject == "reasoning"
+        and matched in _BROAD_REASONING_SUBJECT_SIGNALS
+        and _requires_quantitative_solving_method(query_lower)
+    ):
+        return False
+
+    return True
+
+
+def _count_constraint_clauses(query_lower: str) -> int:
+    markers = (
+        " if ",
+        " then ",
+        " who ",
+        " which ",
+        " given that ",
+        " such that ",
+        " does not ",
+        " cannot ",
+        " neither ",
+        " either ",
+    )
+    count = sum(1 for marker in markers if marker in query_lower)
+    count += query_lower.count(";")
+    count += query_lower.count(" and ")
+    return count
+
+
+def _count_named_entities(query: str) -> int:
+    tokens = query.split()
+    entities = 0
+    for idx, token in enumerate(tokens):
+        cleaned = token.strip(".,;:!?()[]\"'")
+        if not cleaned or not cleaned[0].isupper():
+            continue
+        if idx == 0 and len(tokens) > 1:
+            continue
+        if cleaned.lower() in {"the", "a", "an", "if", "then", "who", "which"}:
+            continue
+        entities += 1
+    return entities
+
+
+def _has_statements_conclusions_structure(query_lower: str) -> bool:
+    if "statement" in query_lower and "conclusion" in query_lower:
+        return True
+    return "all " in query_lower and "some " in query_lower
+
+
+def _has_multi_direction_turns(query_lower: str) -> bool:
+    turn_markers = (
+        "turns left",
+        "turns right",
+        "facing north",
+        "facing south",
+        "facing east",
+        "facing west",
+    )
+    return sum(1 for marker in turn_markers if marker in query_lower) >= 2
+
+
+def _has_structural_complexity(query: str, query_lower: str) -> bool:
+    if _count_constraint_clauses(query_lower) >= 4:
+        return True
+    if _count_named_entities(query) >= 5:
+        return True
+    if _has_statements_conclusions_structure(query_lower):
+        return True
+    if _has_multi_direction_turns(query_lower):
+        return True
+    return len(query.strip()) >= 280
+
+
+def _has_moderate_quant_complexity(query_lower: str) -> bool:
+    quant_ops = (
+        "profit",
+        "loss",
+        "discount",
+        "percentage",
+        "ratio",
+        "mixture",
+        "average",
+        "interest",
+        "partnership",
+    )
+    hits = sum(1 for op in quant_ops if op in query_lower)
+    return hits >= 2 and not _query_has_advanced_signal(query_lower)
+
+
+def _detect_structural_difficulty(
+    query: str,
+    subject: str,
+    *,
+    pattern_topic_key: str | None,
+) -> tuple[str | None, str]:
+    """Return (new_difficulty, matched_signal_category) or (None, 'none')."""
+    from services.context_retrieval.context_retrieval_service import (  # noqa: PLC0415
+        _ADVANCED_REASONING_TOPICS,
+        _INTERMEDIATE_REASONING_TOPICS,
+    )
+
+    query_lower = query.lower()
+    topic = (pattern_topic_key or "").upper()
+
+    if subject == "reasoning" and topic in _ADVANCED_REASONING_TOPICS:
+        return "advanced", "reasoning_pattern_advanced"
+
+    if _has_structural_complexity(query, query_lower):
+        if subject == "reasoning" or topic in _ADVANCED_REASONING_TOPICS:
+            return "advanced", "structural_complexity"
+
+    if subject == "reasoning" and topic in _INTERMEDIATE_REASONING_TOPICS:
+        return "intermediate", "intermediate_reasoning_pattern"
+
+    if subject == "math" and _has_moderate_quant_complexity(query_lower):
+        return "intermediate", "intermediate_quant_pattern"
+
+    return None, "none"
+
+
+def apply_classification_policy(
+    query: str,
+    classification: dict[str, Any],
+    *,
+    request_id: str = "",
+    classifier_confidence: float | None = None,
+) -> dict[str, Any]:
+    """Deterministic post-classification safety net — not the primary classifier.
+
+    Subject correction is blocked when the primary classifier is high-confidence,
+    and math-priority queries must not be overridden to reasoning via broad keywords.
+    """
+    query_lower = query.lower()
+    old_subject = str(classification.get("subject") or "general")
+    old_difficulty = str(classification.get("difficulty") or "default")
+    new_subject = old_subject
+    new_difficulty = old_difficulty
+    matched_signal = "none"
+    reason = ""
+    threshold = get_classifier_confidence_threshold()
+
+    detected_subject = _detect_policy_subject(query_lower)
+    if detected_subject and _should_apply_subject_correction(
+        query_lower,
+        old_subject,
+        detected_subject,
+        classifier_confidence=classifier_confidence,
+    ):
+        new_subject = detected_subject
+        matched_signal = _find_matched_signal(
+            query_lower,
+            _POLICY_REASONING_SIGNALS + _POLICY_MATH_SIGNALS + _POLICY_ENGLISH_SIGNALS,
+        ) or "subject"
+        reason = "explicit_subject_signal"
+
+    from services.context_retrieval.context_retrieval_service import (  # noqa: PLC0415
+        derive_pattern_hints,
+    )
+
+    hints = derive_pattern_hints(query, new_subject, classification)
+
+    if _query_has_advanced_signal(query_lower):
+        new_difficulty = "advanced"
+        if matched_signal == "none":
+            matched_signal = (
+                _find_matched_signal(query_lower, _POLICY_ADVANCED_SIGNALS) or "advanced"
+            )
+        reason = reason or "explicit_advanced_signal"
+    else:
+        structural_difficulty, structural_signal = _detect_structural_difficulty(
+            query,
+            new_subject,
+            pattern_topic_key=hints.pattern_topic_key,
+        )
+        if structural_difficulty == "advanced" and new_difficulty != "advanced":
+            new_difficulty = "advanced"
+            if matched_signal == "none":
+                matched_signal = structural_signal
+            reason = reason or structural_signal
+        elif (
+            structural_difficulty == "intermediate"
+            and new_difficulty in {"default", "basic"}
+        ):
+            new_difficulty = "intermediate"
+            if matched_signal == "none":
+                matched_signal = structural_signal
+            reason = reason or structural_signal
+        elif _query_has_basic_signal(query_lower) and old_difficulty == "default":
+            new_difficulty = "basic"
+            if matched_signal == "none":
+                matched_signal = _find_matched_signal(query_lower, _POLICY_BASIC_SIGNALS) or "basic"
+            reason = reason or "explicit_basic_signal"
+
+    applied = new_subject != old_subject or new_difficulty != old_difficulty
+    logger.info(
+        "classification_policy  request_id=%s  policy_checked=true  policy_applied=%s  "
+        "confidence_threshold=%.2f  classifier_confidence=%s  "
+        "old_subject=%s  new_subject=%s  old_difficulty=%s  new_difficulty=%s  "
+        "matched_signal=%s  reason=%s",
+        request_id,
+        str(applied).lower(),
+        threshold,
+        f"{classifier_confidence:.2f}"
+        if classifier_confidence is not None
+        else "none",
+        old_subject,
+        new_subject,
+        old_difficulty,
+        new_difficulty,
+        matched_signal,
+        reason if applied else "none",
+    )
+    logger.info(
+        "classification_policy_summary  request_id=%s  policy_applied=%s  "
+        "subject=%s  difficulty=%s  pattern_topic=%s  matched_signal=%s",
+        request_id,
+        str(applied).lower(),
+        new_subject,
+        new_difficulty,
+        hints.pattern_topic_key or "none",
+        matched_signal,
+    )
+
+    if not applied:
+        return classification
+
+    updated = dict(classification)
+    updated["subject"] = new_subject
+    updated["difficulty"] = new_difficulty
+    return updated
+
+
+def _build_query_classification(
+    parsed: QueryClassification,
+    *,
+    classification_source: str | None = None,
+    confidence_override: float | None = None,
+) -> QueryClassification:
+    """Copy validated classifier fields including retrieval hints."""
+    return QueryClassification(
+        intent=parsed.intent,
+        subject=parsed.subject,
+        topic=parsed.topic,
+        topic_confidence=parsed.topic_confidence,
+        pattern_topic_candidate=parsed.pattern_topic_candidate,
+        pattern_family_candidate=parsed.pattern_family_candidate,
+        retrieval_tags=parsed.retrieval_tags,
+        difficulty=parsed.difficulty,
+        response_style=parsed.response_style,
+        confidence=confidence_override if confidence_override is not None else parsed.confidence,
+        retrieval_need=parsed.retrieval_need,
+        reasoning_summary=parsed.reasoning_summary,
+        need_web_search=parsed.need_web_search,
+        web_search_reason=parsed.web_search_reason,
+        web_search_query=parsed.web_search_query,
+        classification_source=classification_source or parsed.classification_source,  # type: ignore[arg-type]
+    )
+
+
 def _classify_deterministic(query: str) -> QueryClassification:
     """Classify a student query using keyword matching. No network calls."""
     query_lower = query.lower()
-    intent, confidence = _detect_intent(query_lower)
-    subject = _detect_subject(query_lower)
-    difficulty = _detect_difficulty(query_lower)
+    policy_subject = _detect_policy_subject(query_lower)
+    quant_method = _requires_quantitative_solving_method(query_lower)
+    logic_method = _requires_logical_inference_method(query_lower)
+    intent_from_kw, conf_from_kw = _detect_intent(query_lower)
+
+    if policy_subject == "math" or quant_method:
+        subject = "math"
+        if quant_method or intent_from_kw == "solve_question":
+            intent = "solve_question"
+            confidence = 0.82 if quant_method else max(conf_from_kw, 0.75)
+        else:
+            intent = intent_from_kw
+            confidence = conf_from_kw
+        difficulty = _detect_difficulty(query_lower)
+        if difficulty == "default" and quant_method:
+            difficulty = "intermediate"
+    elif policy_subject == "reasoning" or logic_method:
+        subject = "reasoning"
+        if logic_method or intent_from_kw == "solve_question":
+            intent = "solve_question"
+            confidence = 0.80
+        else:
+            intent = intent_from_kw
+            confidence = conf_from_kw
+        difficulty = _detect_difficulty(query_lower)
+    elif policy_subject == "english":
+        subject = "english"
+        intent = intent_from_kw
+        confidence = conf_from_kw
+        difficulty = _detect_difficulty(query_lower)
+    else:
+        intent = intent_from_kw
+        confidence = conf_from_kw
+        subject = _detect_subject(query_lower)
+        difficulty = _detect_difficulty(query_lower)
+        if subject in {"unknown", "general"} and quant_method:
+            subject = "math"
+            intent = "solve_question"
+            confidence = max(confidence, 0.80)
+            if difficulty == "default":
+                difficulty = "intermediate"
+        elif subject in {"unknown", "general"} and logic_method:
+            subject = "reasoning"
+            intent = "solve_question"
+            confidence = max(confidence, 0.78)
+
     response_style = _detect_style(query_lower, intent)
+
+    from services.context_retrieval.context_retrieval_service import (  # noqa: PLC0415
+        resolve_retrieval_hints,
+    )
+
+    hints = resolve_retrieval_hints(query, subject, {})
+    pattern_candidate = hints.pattern_topic_key if hints.strength in {"medium", "strong"} else None
 
     result = QueryClassification(
         intent=intent,  # type: ignore[arg-type]
         subject=subject,
-        topic=None,
+        topic=hints.topic_hint or pattern_candidate,
+        topic_confidence=0.80 if pattern_candidate else None,
+        pattern_topic_candidate=pattern_candidate,
+        pattern_family_candidate=hints.pattern_family_key,
+        retrieval_tags=hints.retrieval_tags or hints.matched_signals[:10],
         difficulty=difficulty,  # type: ignore[arg-type]
         response_style=response_style,  # type: ignore[arg-type]
         confidence=confidence,
@@ -240,38 +994,56 @@ def _load_classifier_prompt() -> str:
     return load_prompt("query_classifier")
 
 
+def _parse_classifier_orchestrated_content(
+    content: str,
+    *,
+    route_id: str,
+) -> QueryClassification:
+    """Strict-parse classifier JSON and validate against QueryClassification."""
+    from services.doubt_solver.classifier_json import (  # noqa: PLC0415
+        parse_classifier_json_strict,
+    )
+
+    raw_dict, recovered = parse_classifier_json_strict(content)
+    if recovered:
+        logger.info(
+            "classifier_json_recovered  route_id=%s  classifier_json_recovered=true",
+            route_id,
+        )
+    classification = QueryClassification.model_validate(raw_dict)
+    return _build_query_classification(classification, classification_source="llm")
+
+
 def _classify_with_llm_orchestrated(
-    query: str, request_id: str | None = None
+    query: str,
+    request_id: str | None = None,
+    *,
+    task_role: str = "classifier",
 ) -> QueryClassification:
     """Run classification via the orchestrated Azure-first path.
 
-    Resolves route with subject="general", task_role="classifier",
-    difficulty="default" — hitting doubt_solver_classifier (Azure primary)
-    with doubt_solver_classifier_openai_native as fallback.
+    Resolves route with subject="general", task_role (classifier or
+    classifier_strong), difficulty="default".
 
     Args:
         query:      The student's question (already validated by caller).
-        request_id: Trace ID propagated from the graph state.  If None
-                    (legacy callers without a trace ID), a new UUID is
-                    generated at this boundary so RouteRequest validation
-                    does not fail.  Callers should always pass the
-                    originating request_id when available.
+        request_id: Trace ID propagated from the graph state.
+        task_role:  Orchestration task role — ``classifier`` (primary) or
+                    ``classifier_strong`` (low-confidence fallback).
 
     Raises:
         Any exception from orchestrator, JSON parsing, or validation.
-        Caller must handle (ProviderExecutionError, JSONDecodeError, etc.).
     """
     from schemas.llm_routing import RouteRequest  # noqa: PLC0415
 
-    # Use the provided request_id; generate one at the boundary only when the
-    # caller has no trace ID (non-orchestrated legacy entrypoints).
     _request_id = request_id or str(uuid.uuid4())
+    route_id = f"general.{task_role}.default"
 
     orchestrator = _get_classifier_orchestrator()
     route_request = RouteRequest(
         request_id=_request_id,
         subject="general",
-        task_role="classifier",
+        task_role=task_role,  # type: ignore[arg-type]
         difficulty="default",
         intent="classify",
     )
@@ -283,52 +1055,165 @@ def _classify_with_llm_orchestrated(
         context=None,
     )
 
-    # [AI RISK] LLM output is untrusted — parse and validate before use.
-    raw = json.loads(result.content)
-    classification = QueryClassification.model_validate(raw)
-    return QueryClassification(
-        intent=classification.intent,
-        subject=classification.subject,
-        topic=classification.topic,
-        difficulty=classification.difficulty,
-        response_style=classification.response_style,
-        confidence=classification.confidence,
-        retrieval_need=classification.retrieval_need,
-        reasoning_summary=classification.reasoning_summary,
-        classification_source="llm",
+    return _parse_classifier_orchestrated_content(result.content, route_id=route_id)
+
+
+def _deterministic_classifier_fallback(
+    query: str,
+    *,
+    strong_classifier_used: bool = False,
+) -> ClassifierRunResult:
+    """Hardened deterministic fallback when both classifier models fail."""
+    fallback = _classify_deterministic(query)
+    return ClassifierRunResult(
+        classification=_build_query_classification(
+            fallback,
+            classification_source="fallback",
+            confidence_override=max(fallback.confidence, 0.55),
+        ),
+        strong_classifier_used=strong_classifier_used,
     )
 
 
 def _classify_with_llm_orchestrated_or_fallback(
-    query: str, request_id: str | None = None
-) -> QueryClassification:
-    """Run orchestrated classifier; fall back to deterministic on any failure."""
+    query: str,
+    request_id: str | None = None,
+    *,
+    on_before_strong_classifier: Callable[[], None] | None = None,
+) -> ClassifierRunResult:
+    """Run orchestrated classifier with strong-model fallback on low confidence."""
     t_start = time.perf_counter()
+    _rid = request_id or "unknown"
+    primary_route_id = "general.classifier.default"
+    threshold = get_classifier_confidence_threshold()
+
     try:
-        result = _classify_with_llm_orchestrated(query, request_id=request_id)
+        primary = _classify_with_llm_orchestrated(
+            query, request_id=request_id, task_role="classifier"
+        )
+        _log_classifier_primary_result(
+            primary, valid_json=True, route_id=primary_route_id
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log_classifier_json_error(exc, route_id=primary_route_id)
+        _log_classifier_fallback_decision(
+            request_id=_rid,
+            reason="primary_invalid_json",
+            fallback_used=True,
+            strong_classifier_used=True,
+        )
+        if on_before_strong_classifier is not None:
+            on_before_strong_classifier()
+        try:
+            strong = _classify_with_llm_orchestrated(
+                query,
+                request_id=request_id,
+                task_role=_CLASSIFIER_STRONG_TASK_ROLE,
+            )
+            _log_classifier_primary_result(
+                strong,
+                valid_json=True,
+                route_id="general.classifier_strong.default",
+            )
+            duration_ms = (time.perf_counter() - t_start) * 1000
+            logger.info(
+                "orchestrated_classifier  request_id=%s  primary_failed=true  "
+                "confidence_threshold=%.2f  fallback_used=true  "
+                "final_source=llm_strong  duration_ms=%.2f",
+                _rid,
+                threshold,
+                duration_ms,
+            )
+            return ClassifierRunResult(classification=strong, strong_classifier_used=True)
+        except Exception as strong_exc:  # noqa: BLE001
+            _log_classifier_json_error(
+                strong_exc, route_id="general.classifier_strong.default"
+            )
+            _log_classifier_fallback_decision(
+                request_id=_rid,
+                reason="strong_invalid_json",
+                fallback_used=True,
+                strong_classifier_used=True,
+            )
+            logger.warning(
+                "Strong classifier failed — using deterministic fallback: %s  request_id=%s",
+                type(strong_exc).__name__,
+                _rid,
+            )
+            return _deterministic_classifier_fallback(query, strong_classifier_used=True)
+
+    needs_strong = (
+        primary.confidence < threshold
+        or _classifier_conflicts_with_signals(query, primary)
+    )
+    if not needs_strong:
         duration_ms = (time.perf_counter() - t_start) * 1000
+        _log_classifier_fallback_decision(
+            request_id=_rid,
+            reason="primary_accepted",
+            fallback_used=False,
+            strong_classifier_used=False,
+        )
         logger.info(
-            "orchestrated_classifier  intent=%s  confidence=%.2f  source=llm  duration_ms=%.2f",
-            result.intent,
-            result.confidence,
+            "orchestrated_classifier  request_id=%s  primary_confidence=%.2f  "
+            "confidence_threshold=%.2f  fallback_used=false  final_source=llm  "
+            "duration_ms=%.2f",
+            _rid,
+            primary.confidence,
+            threshold,
             duration_ms,
         )
-        return result
+        return ClassifierRunResult(classification=primary, strong_classifier_used=False)
+
+    reason = (
+        "primary_low_confidence"
+        if primary.confidence < threshold
+        else "primary_signal_conflict"
+    )
+    _log_classifier_fallback_decision(
+        request_id=_rid,
+        reason=reason,
+        fallback_used=True,
+        strong_classifier_used=True,
+    )
+
+    if on_before_strong_classifier is not None:
+        on_before_strong_classifier()
+
+    try:
+        strong = _classify_with_llm_orchestrated(
+            query,
+            request_id=request_id,
+            task_role=_CLASSIFIER_STRONG_TASK_ROLE,
+        )
+        _log_classifier_primary_result(
+            strong,
+            valid_json=True,
+            route_id="general.classifier_strong.default",
+        )
+        duration_ms = (time.perf_counter() - t_start) * 1000
+        logger.info(
+            "orchestrated_classifier  request_id=%s  primary_confidence=%.2f  "
+            "confidence_threshold=%.2f  fallback_used=true  final_source=llm_strong  "
+            "duration_ms=%.2f",
+            _rid,
+            primary.confidence,
+            threshold,
+            duration_ms,
+        )
+        return ClassifierRunResult(classification=strong, strong_classifier_used=True)
     except Exception as exc:  # noqa: BLE001
+        _log_classifier_json_error(exc, route_id="general.classifier_strong.default")
+        duration_ms = (time.perf_counter() - t_start) * 1000
         logger.warning(
-            "Orchestrated classifier failed — falling back to deterministic: %s", exc
+            "Strong classifier failed — using deterministic fallback: %s  request_id=%s  "
+            "primary_confidence=%.2f  duration_ms=%.2f",
+            type(exc).__name__,
+            _rid,
+            primary.confidence,
+            duration_ms,
         )
-        fallback = _classify_deterministic(query)
-        return QueryClassification(
-            intent=fallback.intent,
-            subject=fallback.subject,
-            topic=fallback.topic,
-            difficulty=fallback.difficulty,
-            response_style=fallback.response_style,
-            confidence=min(fallback.confidence, 0.55),
-            retrieval_need=fallback.retrieval_need,
-            classification_source="fallback",
-        )
+        return _deterministic_classifier_fallback(query, strong_classifier_used=True)
 
 
 def _classify_with_llm(query: str) -> QueryClassification:
@@ -350,21 +1235,12 @@ def _classify_with_llm(query: str) -> QueryClassification:
     response = model_router.generate(_CLASSIFIER_ROLE, messages)
 
     # [AI RISK] LLM output is untrusted — parse and validate before use.
-    raw = json.loads(response.content)
-    classification = QueryClassification.model_validate(raw)
+    from services.doubt_solver.classifier_json import parse_classifier_json_strict  # noqa: PLC0415
 
-    # Override source field regardless of what the model returned.
-    return QueryClassification(
-        intent=classification.intent,
-        subject=classification.subject,
-        topic=classification.topic,
-        difficulty=classification.difficulty,
-        response_style=classification.response_style,
-        confidence=classification.confidence,
-        retrieval_need=classification.retrieval_need,
-        reasoning_summary=classification.reasoning_summary,
-        classification_source="llm",
-    )
+    raw_dict, _recovered = parse_classifier_json_strict(response.content)
+    classification = QueryClassification.model_validate(raw_dict)
+
+    return _build_query_classification(classification, classification_source="llm")
 
 
 def _classify_with_llm_or_fallback(query: str) -> QueryClassification:
@@ -384,15 +1260,10 @@ def _classify_with_llm_or_fallback(query: str) -> QueryClassification:
         # Log safe warning — exc may contain partial model output; never log query.
         logger.warning("LLM classifier failed — falling back to deterministic: %s", exc)
         fallback = _classify_deterministic(query)
-        return QueryClassification(
-            intent=fallback.intent,
-            subject=fallback.subject,
-            topic=fallback.topic,
-            difficulty=fallback.difficulty,
-            response_style=fallback.response_style,
-            confidence=min(fallback.confidence, 0.55),
-            retrieval_need=fallback.retrieval_need,
+        return _build_query_classification(
+            fallback,
             classification_source="fallback",
+            confidence_override=min(fallback.confidence, 0.55),
         )
 
 
@@ -401,7 +1272,12 @@ def _classify_with_llm_or_fallback(query: str) -> QueryClassification:
 # ---------------------------------------------------------------------------
 
 
-def classify_query(query: str, request_id: str | None = None) -> QueryClassification:
+def classify_query(
+    query: str,
+    request_id: str | None = None,
+    *,
+    on_before_strong_classifier: Callable[[], None] | None = None,
+) -> QueryClassification:
     """Classify a student query, dispatching to LLM or deterministic based on config.
 
     Args:
@@ -410,6 +1286,8 @@ def classify_query(query: str, request_id: str | None = None) -> QueryClassifica
                     ``state["request_id"]`` from graph nodes.  Optional for
                     legacy callers — a new UUID is generated at the boundary
                     when not provided.
+        on_before_strong_classifier: Optional hook invoked once before the strong
+                    classifier runs (streaming UX only).
 
     Returns:
         A validated QueryClassification instance.
@@ -433,7 +1311,11 @@ def classify_query(query: str, request_id: str | None = None) -> QueryClassifica
     # Orchestrated path — Azure-first via model registry when
     # ENABLE_ORCHESTRATED_DOUBT_SOLVER=true.
     if settings.enable_orchestrated_doubt_solver:
-        return _classify_with_llm_orchestrated_or_fallback(query, request_id=request_id)
+        return _classify_with_llm_orchestrated_or_fallback(
+            query,
+            request_id=request_id,
+            on_before_strong_classifier=on_before_strong_classifier,
+        ).classification
 
     # Legacy model_router path — ENABLE_ORCHESTRATED_DOUBT_SOLVER=false.
     # Check whether the classifier role is explicitly configured.

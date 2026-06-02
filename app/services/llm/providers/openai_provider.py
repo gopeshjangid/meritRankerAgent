@@ -188,6 +188,7 @@ class OpenAIProviderAdapter:
                 When None, a real openai.OpenAI client is created at call time.
         """
         self._client_factory = client_factory
+        self.last_stream_finish_reason: str | None = None
 
     def _build_client(self, credentials: ProviderCredentials) -> Any:
         """Create or return the injected OpenAI client."""
@@ -323,12 +324,17 @@ class OpenAIProviderAdapter:
                 max_tokens=request.max_tokens,
                 stream=True,
             )
+            finish_reason: str | None = None
             for chunk in stream:
                 if not chunk.choices:
                     continue
+                fr = getattr(chunk.choices[0], "finish_reason", None)
+                if fr is not None:
+                    finish_reason = fr
                 delta = chunk.choices[0].delta.content or ""
                 if delta:
                     yield delta
+            self.last_stream_finish_reason = finish_reason or "stop"
         except Exception as exc:
             failure_kind = _classify_openai_error(exc)
             raise LlmProviderExecutionError(

@@ -56,6 +56,16 @@ provider_profiles:
   gemini_primary:
     provider: gemini
     api_key_env: GEMINI_API_KEY
+    base_url_env: GEMINI_BASE_URL
+    optional_api_key: true
+    optional_base_url: true
 
   local_mock:
     provider: mock
+
+  deepseek_primary:
+    provider: deepseek
+    api_key_env: DEEPSEEK_API_KEY
+    base_url_env: DEEPSEEK_BASE_URL
+    optional_api_key: true
+    optional_base_url: true

@@ -20,6 +20,7 @@ by counting adapter call_count only — the tests do not inspect bytecode.
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -54,6 +55,7 @@ class _FakeAdapter:
         intent: str,
         difficulty: str,
         context: str,
+        web_search_reason: str | None = None,
     ) -> str:
         self.call_count += 1
         self.last_kwargs = {
@@ -63,6 +65,7 @@ class _FakeAdapter:
             "intent": intent,
             "difficulty": difficulty,
             "context": context,
+            "web_search_reason": web_search_reason,
         }
         return self._content
 
@@ -189,10 +192,12 @@ class TestMapToOrchestratedClassification:
         result = _map_to_orchestrated_classification(qc)
         assert isinstance(result, dict)
 
-    def test_result_has_exactly_four_keys(self) -> None:
+    def test_result_includes_core_and_optional_hint_keys(self) -> None:
         qc = self._make_qc()
         result = _map_to_orchestrated_classification(qc)
-        assert set(result.keys()) == {"subject", "intent", "difficulty", "retrieval_required"}
+        assert {"subject", "intent", "difficulty", "retrieval_required"}.issubset(
+            result.keys()
+        )
 
 
 # ===========================================================================
@@ -229,15 +234,12 @@ class TestOrchestratedClassifyNode:
         result = _orchestrated_classify_node(state)
         assert "retrieval_required" in result["classification"]
 
-    def test_classification_has_exactly_four_keys(self) -> None:
+    def test_classification_includes_core_and_optional_hint_keys(self) -> None:
         state = _minimal_state(query="Solve: 2x + 5 = 15")
         result = _orchestrated_classify_node(state)
-        assert set(result["classification"].keys()) == {
-            "subject",
-            "intent",
-            "difficulty",
-            "retrieval_required",
-        }
+        assert {"subject", "intent", "difficulty", "retrieval_required"}.issubset(
+            set(result["classification"].keys())
+        )
 
     def test_node_does_not_write_answer(self) -> None:
         state = _minimal_state()
@@ -348,6 +350,94 @@ class TestOrchestratedCollectContextNode:
         state = _minimal_state(classification=self._NO_RETRIEVAL)
         result = _orchestrated_collect_context_node(state)
         assert "dynamodb_records" not in result
+
+    def test_sets_context_text_from_service(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from services.context_retrieval import context_retrieval_service as crs_module
+        from services.context_retrieval.context_models import ContextRetrievalResult
+
+        mock_service = crs_module.ContextRetrievalService(kb_retriever=MagicMock())
+        monkeypatch.setattr(
+            crs_module,
+            "get_context_retrieval_service",
+            lambda: mock_service,
+        )
+
+        def _fake_retrieve(_request: Any, **kwargs: Any) -> ContextRetrievalResult:
+            return ContextRetrievalResult(
+                context_text="Relevant context:\n\n1. Pattern:\n   Discount rule.",
+                item_count=1,
+                retrieval_used=True,
+                reason="intent_explain",
+            )
+
+        monkeypatch.setattr(mock_service, "retrieve_context", _fake_retrieve)
+
+        state = _minimal_state(
+            query="Explain discount pattern",
+            classification={
+                "subject": "math",
+                "intent": "explain",
+                "difficulty": "intermediate",
+                "retrieval_required": True,
+            },
+        )
+        result = _orchestrated_collect_context_node(state)
+        assert "Relevant context" in result["context_text"]
+
+    def test_selected_kb_formatting_failure_still_returns_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from services.context_retrieval import context_retrieval_service as crs_module
+
+        monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "true")
+        import config as cfg_module  # noqa: PLC0415
+
+        cfg_module._settings = None
+
+        retriever = MagicMock()
+        from services.context_retrieval.context_models import RetrievedContextItem
+        from services.context_retrieval.context_retrieval_service import LANE_SUBJECT_TOPIC
+
+        retriever.retrieve_lane.return_value = (
+            [
+                RetrievedContextItem(
+                    text="Relative speed when trains move in opposite directions.",
+                    score=0.97,
+                    metadata={
+                        "subject": "QUANT",
+                        "patternTopicKey": "TIME_SPEED_DISTANCE",
+                        "conceptTags": "SPEED,TIME",
+                    },
+                    match_lane=LANE_SUBJECT_TOPIC,
+                )
+            ],
+            5,
+        )
+        broken_builder = MagicMock()
+        broken_builder.build.side_effect = ValueError("brief failure")
+        mock_service = crs_module.ContextRetrievalService(
+            kb_retriever=retriever,
+            brief_builder=broken_builder,
+        )
+        monkeypatch.setattr(
+            crs_module,
+            "get_context_retrieval_service",
+            lambda: mock_service,
+        )
+
+        state = _minimal_state(
+            query="Train crosses platform in 18 seconds at 54 km/hr",
+            classification={
+                "subject": "math",
+                "intent": "solve",
+                "difficulty": "intermediate",
+                "topic": "TIME_SPEED_DISTANCE",
+            },
+        )
+        result = _orchestrated_collect_context_node(state)
+        assert len(result["context_text"]) > 0
+        assert "[Relevant KB Context]" in result["context_text"]
+        assert set(result.keys()) == {"context_text"}
 
 
 # ===========================================================================

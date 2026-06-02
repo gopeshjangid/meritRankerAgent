@@ -150,12 +150,12 @@ class TestExactRouteResolution:
         decision = resolve_route(req, registry)
         assert decision.route_source == "exact"
 
-    def test_math_generator_advanced_uses_reasoning_model(
+    def test_math_generator_advanced_uses_advanced_model(
         self, registry: LlmConfigRegistry
     ) -> None:
         req = _request("math", "generator", "advanced")
         decision = resolve_route(req, registry)
-        assert decision.model == "math_reasoning_generator"
+        assert decision.model == "math_advanced_generator"
 
     def test_math_generator_default_resolves_exact(
         self, registry: LlmConfigRegistry
@@ -198,15 +198,14 @@ class TestExactRouteResolution:
 
 
 class TestSubjectDefaultFallback:
-    def test_no_intermediate_route_falls_back_to_subject_default(
+    def test_general_intermediate_route_resolves_exact(
         self, registry: LlmConfigRegistry
     ) -> None:
-        # "general" subject only has a "default" difficulty route.
-        # Requesting "medium" (→ "intermediate") triggers subject_default fallback.
         req = _request("general", "generator", "medium")
         decision = resolve_route(req, registry)
-        assert decision.route_source == "subject_default"
-        assert decision.difficulty == "default"
+        assert decision.route_source == "exact"
+        assert decision.difficulty == "intermediate"
+        assert decision.max_tokens == 1400
 
     def test_subject_default_has_same_subject(
         self, registry: LlmConfigRegistry

@@ -430,6 +430,8 @@ Part 6 adds concrete provider adapter implementations under
 | `MockProviderAdapter` | `mock_provider.py` | In-process fake for tests; records `last_request`/`call_count` |
 | `OpenAIProviderAdapter` | `openai_provider.py` | Wraps `openai.OpenAI`; requires `api_key` + `model_id` |
 | `AzureOpenAIProviderAdapter` | `azure_openai_provider.py` | Supports `azure_deployment_chat_completions` (AzureOpenAI SDK) and `azure_openai_v1` (OpenAI SDK + base_url). Requires `api_key`, `endpoint`, `deployment`. `api_version` required only in classic mode. |
+| `GeminiProviderAdapter` | `openai_compatible_adapter.py` | OpenAI-compatible Gemini endpoint; text + optional `generate_with_image()` (adapter-level). |
+| `DeepSeekProviderAdapter` | `openai_compatible_adapter.py` | OpenAI-compatible DeepSeek chat/reasoner endpoint. |
 | `ProviderAdapterFactory` | `provider_factory.py` | Maps provider names → adapter instances; supports custom injection |
 | `ProviderAdapterExecutor` | `llm_orchestration/model_execution.py` | Resolves credentials → gets adapter → calls `generate()` |
 
@@ -464,7 +466,7 @@ from services.secrets.provider_credentials import ProviderCredentialResolver
 
 executor = ProviderAdapterExecutor(
     credential_resolver=ProviderCredentialResolver(secret_resolver=EnvSecretResolver()),
-    provider_factory=ProviderAdapterFactory(),   # default: mock + openai + azure_openai
+    provider_factory=ProviderAdapterFactory(),   # default: mock + openai + azure_openai + gemini + deepseek
 )
 result = executor.execute(request)
 ```
@@ -663,18 +665,25 @@ Previously, `QueryClassification` had no `difficulty` field, so `_map_to_orchest
 | `intermediate` | Query contains "intermediate", "moderate" |
 | `default` | No difficulty signal detected |
 
+#### Classifier confidence fallback (Part 13.1)
+
+| Route | Model alias | When used |
+|---|---|---|
+| `general.classifier.default` | `doubt_solver_classifier` | Primary classifier (always first) |
+| When primary confidence < **0.92** (configurable via `DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD`) | `doubt_solver_classifier_strong` | One retry max |
+
+Task role `classifier_strong` is a system task role — not a generator intent overlay.
+
 #### Classification flow
 
 ```
 student query
-  → _classify_deterministic() / LLM classifier
-      sets QueryClassification.difficulty = "advanced" | "basic" | "intermediate" | "default"
+  → primary LLM classifier (doubt_solver_classifier)
+  → if confidence < threshold (default 0.92): strong classifier (doubt_solver_classifier_strong)
   → _map_to_orchestrated_classification()
       passes raw.difficulty through to DoubtSolverClassification.difficulty
-  → _generate_node reads classification_dict["difficulty"]
-  → AnswerGenerationAdapter.generate(difficulty=...)
-  → RouteRequest(difficulty=...)
-  → RouteResolver: exact match → subject_default → general_default
+  → collect_context via ContextRetrievalService
+  → generator
 ```
 
 #### Route lookup order

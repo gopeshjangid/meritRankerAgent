@@ -224,6 +224,16 @@ def test_map_to_orchestrated_classification_passes_difficulty_default() -> None:
     assert result["difficulty"] == "default"
 
 
+def test_map_applies_policy_correction_for_advanced_query() -> None:
+    raw = _make_qc(subject="math", difficulty="default", confidence=0.95)
+    result = _map_to_orchestrated_classification(
+        raw,
+        query="Explain coded inequality for SBI PO mains level",
+    )
+    assert result["difficulty"] == "advanced"
+    assert result["subject"] == "reasoning"
+
+
 class _FakeAdapter:
     """Records kwargs passed to generate()."""
 
@@ -530,12 +540,12 @@ def test_advanced_reasoning_does_not_route_to_subject_default() -> None:
     assert decision.route_source != "subject_default"
 
 
-def test_math_advanced_max_tokens_is_at_least_1200() -> None:
-    """Advanced math route must have enough tokens for practice output."""
+def test_math_advanced_max_tokens_is_at_least_2600() -> None:
+    """Advanced math route must have enough tokens for complete solutions."""
     reg = LlmConfigRegistry()
     route = reg.get_route("math", "generator", "advanced")
     assert route is not None
-    assert route.max_tokens >= 1200, (
-        f"math.generator.advanced max_tokens={route.max_tokens}, expected >= 1200. "
+    assert route.max_tokens >= 2600, (
+        f"math.generator.advanced max_tokens={route.max_tokens}, expected >= 2600. "
         "Increase in llm_routes.yaml."
     )

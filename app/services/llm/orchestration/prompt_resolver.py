@@ -124,6 +124,12 @@ class PromptResolver:
         """
         overlay_paths = list(route_decision.overlays)
 
+        if route_decision.task_role == "generator":
+            contract_path = "generator_answer_contract.md"
+            contract_file = self._prompt_root / contract_path
+            if contract_path not in overlay_paths and contract_file.is_file():
+                overlay_paths.append(contract_path)
+
         # Append intent overlays if the request intent has an entry in the route config.
         # Only overlays explicitly configured in intent_overlays are applied — no auto-append.
         if route_decision.intent:

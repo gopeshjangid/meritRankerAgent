@@ -7,7 +7,7 @@ Model execution boundary backed by the LLM config registry.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from schemas.llm import LlmMessage
@@ -49,7 +49,7 @@ class FakeProviderExecutor:
     def __init__(
         self,
         *,
-        content: str = "Fake provider response.",
+        content: str = "Fake provider response. <ANSWER_DONE>",
         raise_on_execute: Exception | None = None,
         finish_reason: str | None = "stop",
     ) -> None:
@@ -84,6 +84,7 @@ class FakeProviderExecutor:
         chunk_size = 8
         for i in range(0, len(self._content), chunk_size):
             yield self._content[i : i + chunk_size]
+        self.last_stream_finish_reason = self._finish_reason
 
 
 class RegistryBackedModelExecutor:
@@ -103,6 +104,7 @@ class RegistryBackedModelExecutor:
             if model_config_resolver is not None
             else ModelConfigResolver()
         )
+        self.last_stream_finish_reason: str | None = None
 
     def execute(
         self,
@@ -254,6 +256,7 @@ class RegistryBackedModelExecutor:
         *,
         route_decision: RouteDecision,
         messages: list[LlmMessage],
+        on_before_fallback: Callable[[], None] | None = None,
     ) -> Iterator[str]:
         """Resolve model metadata and stream answer text chunks from the provider."""
         primary_alias = route_decision.model
@@ -279,8 +282,12 @@ class RegistryBackedModelExecutor:
         )
 
         primary_failure_kind: str | None = None
+        self.last_stream_finish_reason = None
         try:
             yield from self._provider_executor.execute_stream(primary_request)
+            self.last_stream_finish_reason = getattr(
+                self._provider_executor, "last_stream_finish_reason", "stop"
+            )
             return
         except LlmProviderExecutionError as exc:
             if exc.failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
@@ -307,6 +314,9 @@ class RegistryBackedModelExecutor:
             getattr(model_resolution.model_config, "fallback_models", None) or []
         )
         attempted: list[str] = [primary_alias]
+
+        if fallback_aliases and on_before_fallback is not None:
+            on_before_fallback()
 
         for fallback_alias in fallback_aliases:
             try:
@@ -343,9 +353,13 @@ class RegistryBackedModelExecutor:
             try:
                 if hasattr(self._provider_executor, "execute_stream"):
                     yield from self._provider_executor.execute_stream(fallback_request)
+                    self.last_stream_finish_reason = getattr(
+                        self._provider_executor, "last_stream_finish_reason", "stop"
+                    )
                 else:
                     result = self._provider_executor.execute(fallback_request)
                     yield result.content
+                    self.last_stream_finish_reason = result.finish_reason
                 logger.info(
                     "registry_backed_model_executor.execute_stream  fallback_succeeded  "
                     "fallback_alias=%s  provider=%s  failure_kind=%s",
@@ -417,6 +431,7 @@ class ProviderAdapterExecutor:
             raise TypeError("provider_factory is required.")
         self._credential_resolver = credential_resolver
         self._provider_factory = provider_factory
+        self.last_stream_finish_reason: str | None = None
 
     def execute(self, request: ProviderExecutionRequest) -> ModelExecutionResult:
         """Execute the provider request and return a normalized result.
@@ -458,10 +473,16 @@ class ProviderAdapterExecutor:
         )
 
         if hasattr(adapter, "generate_stream"):
-            yield from adapter.generate_stream(request=request, credentials=credentials)
+            finish_reason: str | None = None
+            for chunk in adapter.generate_stream(request=request, credentials=credentials):
+                if hasattr(adapter, "last_stream_finish_reason"):
+                    finish_reason = adapter.last_stream_finish_reason
+                yield chunk
+            self.last_stream_finish_reason = finish_reason or "stop"
             return
 
         # Buffered fallback when adapter lacks native streaming.
         result = adapter.generate(request=request, credentials=credentials)
         if result.content:
             yield result.content
+        self.last_stream_finish_reason = result.finish_reason or "stop"
