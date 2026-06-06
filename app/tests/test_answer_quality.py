@@ -161,6 +161,54 @@ class TestAnswerQualityValidator:
         assert result.severity == "clean"
 
 
+class TestEmptyGeneratorOutput:
+    def test_empty_content_is_invalid(self) -> None:
+        result = validate_answer_quality(
+            "",
+            subject="reasoning",
+            difficulty="advanced",
+            intent="solve",
+            policy=_policy(),
+        )
+        assert not result.is_valid
+        assert result.severity == "error"
+        assert "empty_answer" in result.reason_codes
+
+    def test_whitespace_content_is_invalid(self) -> None:
+        result = validate_answer_quality(
+            "   \n\t  ",
+            subject="reasoning",
+            difficulty="advanced",
+            intent="solve",
+            policy=_policy(),
+        )
+        assert not result.is_valid
+        assert result.severity == "error"
+        assert "empty_answer" in result.reason_codes
+
+    def test_empty_content_is_not_clean(self) -> None:
+        result = validate_answer_quality(
+            "",
+            subject="math",
+            difficulty="basic",
+            intent="solve",
+            policy=_policy(),
+        )
+        assert result.severity != "clean"
+
+    def test_non_empty_valid_answer_still_clean(self) -> None:
+        text = "**Final Answer:**\n\\(15\\) km/h\n<ANSWER_DONE>"
+        result = validate_answer_quality(
+            text,
+            subject="math",
+            difficulty="intermediate",
+            intent="solve",
+            policy=_policy(),
+        )
+        assert result.is_valid
+        assert result.severity == "clean"
+
+
 class TestRewriteHelpers:
     def test_rewrite_prompt_bans_dollar_delimiters(self) -> None:
         assert "$" in REWRITE_USER_PROMPT

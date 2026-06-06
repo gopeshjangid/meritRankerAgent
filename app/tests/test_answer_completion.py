@@ -64,6 +64,54 @@ class TestAnswerCompletionPolicy:
         )
         assert needs_continuation("partial answer without marker", "stop", policy) is True
 
+    def test_empty_content_blocks_continuation(self) -> None:
+        """Empty partial_content must not trigger continuation (would raise ValidationError)."""
+        policy = AnswerCompletionPolicy(
+            marker="<ANSWER_DONE>",
+            continuation_enabled=True,
+            continuation_max_attempts=1,
+        )
+        assert needs_continuation("", "stop", policy) is False
+        assert needs_continuation("", "length", policy) is False
+        assert needs_continuation("", None, policy) is False
+
+    def test_whitespace_only_content_blocks_continuation(self) -> None:
+        policy = AnswerCompletionPolicy(
+            marker="<ANSWER_DONE>",
+            continuation_enabled=True,
+            continuation_max_attempts=1,
+        )
+        assert needs_continuation("   ", "stop", policy) is False
+        assert needs_continuation("\n\t\n", "length", policy) is False
+
+    def test_should_run_continuation_blocks_on_empty(self) -> None:
+        policy = AnswerCompletionPolicy(
+            marker="<ANSWER_DONE>",
+            continuation_enabled=True,
+            continuation_max_attempts=1,
+        )
+        assert should_run_continuation(
+            "",
+            "stop",
+            policy,
+            provider="azure_openai",
+            task_role="generator",
+        ) is False
+
+    def test_should_run_continuation_allows_non_empty(self) -> None:
+        policy = AnswerCompletionPolicy(
+            marker="<ANSWER_DONE>",
+            continuation_enabled=True,
+            continuation_max_attempts=1,
+        )
+        assert should_run_continuation(
+            "partial answer without marker",
+            "stop",
+            policy,
+            provider="azure_openai",
+            task_role="generator",
+        ) is True
+
     def test_stop_with_final_answer_no_continuation(self) -> None:
         policy = AnswerCompletionPolicy(
             marker="<ANSWER_DONE>",
@@ -337,3 +385,37 @@ class TestCompletionRouteGating:
         )
         assert executor.call_count == 1
         assert result.content == '{"subject":"math"}'
+
+
+class TestOrchestratorEmptyStream:
+    class _EmptyStreamExecutor:
+        last_stream_finish_reason = "length"
+
+        def execute_stream(self, *, route_decision, messages, on_before_fallback=None):  # noqa: ANN001
+            return
+            yield  # pragma: no cover
+
+        def execute(self, *, route_decision, messages):  # noqa: ANN001
+            raise AssertionError("not used")
+
+    def test_empty_stream_yields_safe_failure_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from services.doubt_solver.answer_quality import GENERATION_FAILURE_MESSAGE
+
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "false")
+        cfg_module._settings = None
+        orchestrator = LlmOrchestrator(model_executor=self._EmptyStreamExecutor())
+        chunks = list(
+            orchestrator.generate_stream(
+                route_request=RouteRequest(
+                    request_id="empty-stream-1",
+                    subject="reasoning",
+                    task_role="generator",
+                    difficulty="advanced",
+                    intent="solve",
+                ),
+                query="A reasoning puzzle",
+            )
+        )
+        assert chunks == [GENERATION_FAILURE_MESSAGE]

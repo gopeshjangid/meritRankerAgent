@@ -69,6 +69,10 @@ def needs_continuation(
     finish_reason: str | None,
     policy: AnswerCompletionPolicy,
 ) -> bool:
+    # Empty/whitespace base answer: continuation would create invalid messages and
+    # signals a stream-level failure, not an incomplete answer. Block it.
+    if not content or not content.strip():
+        return False
     if not policy.continuation_enabled or policy.continuation_max_attempts < 1:
         return False
     if finish_reason == "length":
@@ -98,13 +102,68 @@ def should_run_continuation(
     route_id: str | None = None,
 ) -> bool:
     """Apply continuation policy; mock provider skips unless truncated by length."""
+    base_answer_present = bool(content and content.strip())
     if not is_answer_generation_route(task_role=task_role, route_id=route_id):
+        _log_continuation_decision(
+            base_answer_present=base_answer_present,
+            finish_reason=finish_reason,
+            continuation_allowed=False,
+            reason="not_generator_route",
+            content=content,
+            policy=policy,
+        )
         return False
     if not needs_continuation(content, finish_reason, policy):
+        _log_continuation_decision(
+            base_answer_present=base_answer_present,
+            finish_reason=finish_reason,
+            continuation_allowed=False,
+            reason="not_needed",
+            content=content,
+            policy=policy,
+        )
         return False
     if provider == "mock" and finish_reason != "length":
+        _log_continuation_decision(
+            base_answer_present=base_answer_present,
+            finish_reason=finish_reason,
+            continuation_allowed=False,
+            reason="mock_provider_skip",
+            content=content,
+            policy=policy,
+        )
         return False
+    _log_continuation_decision(
+        base_answer_present=base_answer_present,
+        finish_reason=finish_reason,
+        continuation_allowed=True,
+        reason="allowed",
+        content=content,
+        policy=policy,
+    )
     return True
+
+
+def _log_continuation_decision(
+    *,
+    base_answer_present: bool,
+    finish_reason: str | None,
+    continuation_allowed: bool,
+    reason: str,
+    content: str,
+    policy: AnswerCompletionPolicy,
+) -> None:
+    """Emit safe continuation decision diagnostics. Never logs content."""
+    logger.info(
+        "answer_continuation_decision  base_answer_present=%s  finish_reason=%s  "
+        "final_answer_detected=%s  marker_found=%s  continuation_allowed=%s  reason=%s",
+        base_answer_present,
+        finish_reason or "",
+        detect_final_answer(content),
+        has_completion_marker(content, policy.marker),
+        continuation_allowed,
+        reason,
+    )
 
 
 def is_answer_generation_route(

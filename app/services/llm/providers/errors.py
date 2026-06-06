@@ -43,6 +43,8 @@ ProviderFailureKind = Literal[
     "provider_unavailable",
     "invalid_request",
     "unsupported_parameter",
+    "empty_stream",
+    "empty_answer",
     "safety_blocked",
     "unknown_provider_error",
 ]
@@ -59,6 +61,8 @@ FALLBACK_ELIGIBLE_FAILURE_KINDS: frozenset[str] = frozenset({
     "timeout",
     "provider_unavailable",
     "unsupported_parameter",
+    "empty_stream",
+    "empty_answer",
     "unknown_provider_error",
 })
 

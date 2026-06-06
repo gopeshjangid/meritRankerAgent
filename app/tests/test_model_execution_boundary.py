@@ -76,6 +76,8 @@ _TEST_YAML = textwrap.dedent("""\
         capabilities:
           math: medium
           general: medium
+        fallback_models:
+          - safe_mock
       gemini_flash_reasoning_light:
         provider: gemini
         provider_profile: gemini_primary
@@ -553,3 +555,56 @@ def test_unit_tests_do_not_reach_real_dynamodb() -> None:
     assert settings.enable_dynamodb_fetch is False, (
         "ENABLE_DYNAMODB_FETCH must be false in unit tests."
     )
+
+
+class TestEmptyStreamFallback:
+    class _EmptyThenAnswerStreamExecutor:
+        last_stream_finish_reason = "stop"
+
+        def execute_stream(self, request):  # noqa: ANN001
+            alias = request.model_resolution.model_alias
+            if alias == "gemini_flash_light":
+                return
+                yield  # pragma: no cover - marks generator; primary returns empty stream
+            yield "Fallback streamed answer."
+
+        def execute(self, request):  # noqa: ANN001
+            raise AssertionError("execute should not be called in stream-only test")
+
+    def test_empty_primary_stream_triggers_fallback(self, tmp_path: Path) -> None:
+        executor = RegistryBackedModelExecutor(
+            provider_executor=self._EmptyThenAnswerStreamExecutor(),
+            model_config_resolver=ModelConfigResolver(registry=_registry(tmp_path)),
+        )
+        chunks = list(
+            executor.execute_stream(
+                route_decision=_route_decision(model="gemini_flash_light"),
+                messages=_messages(),
+            )
+        )
+        assert chunks == ["Fallback streamed answer."]
+
+    class _AlwaysEmptyStreamExecutor:
+        last_stream_finish_reason = "length"
+
+        def execute_stream(self, request):  # noqa: ANN001
+            return
+            yield  # pragma: no cover
+
+        def execute(self, request):  # noqa: ANN001
+            raise AssertionError("execute should not be called")
+
+    def test_all_empty_streams_raise_provider_execution_error(
+        self, tmp_path: Path
+    ) -> None:
+        executor = RegistryBackedModelExecutor(
+            provider_executor=self._AlwaysEmptyStreamExecutor(),
+            model_config_resolver=ModelConfigResolver(registry=_registry(tmp_path)),
+        )
+        with pytest.raises(ProviderExecutionError):
+            list(
+                executor.execute_stream(
+                    route_decision=_route_decision(model="gemini_flash_light"),
+                    messages=_messages(),
+                )
+            )

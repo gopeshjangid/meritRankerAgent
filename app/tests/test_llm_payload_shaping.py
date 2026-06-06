@@ -320,3 +320,155 @@ class TestAzureUnsupportedParameterErrors:
         combined = " ".join(caplog.messages)
         assert "sk-" not in combined
         assert "Solve this puzzle" not in combined
+
+
+class FakeStreamAzureClient:
+    """Fake Azure client for stream chunk normalization tests."""
+
+    def __init__(self, chunks: list) -> None:
+        self._chunks = chunks
+        self.received_kwargs: dict = {}
+
+        def _create(**kwargs):  # noqa: ANN202
+            self.received_kwargs = kwargs
+            return iter(self._chunks)
+
+        self.chat = types.SimpleNamespace(
+            completions=types.SimpleNamespace(create=_create)
+        )
+
+
+def _make_chunk(
+    content: str | None = None,
+    finish_reason: str | None = None,
+    has_choices: bool = True,
+    delta_none: bool = False,
+) -> object:
+    if not has_choices:
+        return types.SimpleNamespace(choices=[])
+    delta = None if delta_none else types.SimpleNamespace(content=content)
+    choice = types.SimpleNamespace(finish_reason=finish_reason, delta=delta)
+    return types.SimpleNamespace(choices=[choice])
+
+
+class TestAzureStreamNormalization:
+    """Azure generate_stream must handle unusual o4-mini chunk shapes."""
+
+    def test_normal_text_chunks_emitted(self, tmp_path: Path) -> None:
+        chunks = [
+            _make_chunk("Hello "),
+            _make_chunk("world"),
+            _make_chunk(finish_reason="stop"),
+        ]
+        fake = FakeStreamAzureClient(chunks)
+        adapter = AzureOpenAIProviderAdapter(client_factory=lambda _creds: fake)
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key="key",
+            endpoint="https://x.openai.azure.com/openai/v1",
+            azure_api_mode="azure_openai_v1",
+        )
+        result = list(adapter.generate_stream(request=_make_request(tmp_path), credentials=creds))
+        assert result == ["Hello ", "world"]
+
+    def test_empty_choices_chunks_skipped(self, tmp_path: Path) -> None:
+        chunks = [
+            _make_chunk(has_choices=False),
+            _make_chunk("answer"),
+            _make_chunk(finish_reason="stop"),
+        ]
+        fake = FakeStreamAzureClient(chunks)
+        adapter = AzureOpenAIProviderAdapter(client_factory=lambda _creds: fake)
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key="key",
+            endpoint="https://x.openai.azure.com/openai/v1",
+            azure_api_mode="azure_openai_v1",
+        )
+        result = list(adapter.generate_stream(request=_make_request(tmp_path), credentials=creds))
+        assert result == ["answer"]
+
+    def test_none_delta_chunks_skipped(self, tmp_path: Path) -> None:
+        chunks = [
+            _make_chunk(delta_none=True),
+            _make_chunk("content"),
+            _make_chunk(finish_reason="stop"),
+        ]
+        fake = FakeStreamAzureClient(chunks)
+        adapter = AzureOpenAIProviderAdapter(client_factory=lambda _creds: fake)
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key="key",
+            endpoint="https://x.openai.azure.com/openai/v1",
+            azure_api_mode="azure_openai_v1",
+        )
+        result = list(adapter.generate_stream(request=_make_request(tmp_path), credentials=creds))
+        assert result == ["content"]
+
+    def test_none_content_chunks_skipped(self, tmp_path: Path) -> None:
+        chunks = [
+            _make_chunk(content=None),
+            _make_chunk("text"),
+            _make_chunk(content=None, finish_reason="stop"),
+        ]
+        fake = FakeStreamAzureClient(chunks)
+        adapter = AzureOpenAIProviderAdapter(client_factory=lambda _creds: fake)
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key="key",
+            endpoint="https://x.openai.azure.com/openai/v1",
+            azure_api_mode="azure_openai_v1",
+        )
+        result = list(adapter.generate_stream(request=_make_request(tmp_path), credentials=creds))
+        assert result == ["text"]
+
+    def test_all_empty_chunks_produces_no_output(self, tmp_path: Path) -> None:
+        """All-empty stream — e.g. o4-mini returning only internal reasoning."""
+        chunks = [
+            _make_chunk(content=None),
+            _make_chunk(content=None),
+            _make_chunk(content=None, finish_reason="stop"),
+        ]
+        fake = FakeStreamAzureClient(chunks)
+        adapter = AzureOpenAIProviderAdapter(client_factory=lambda _creds: fake)
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key="key",
+            endpoint="https://x.openai.azure.com/openai/v1",
+            azure_api_mode="azure_openai_v1",
+        )
+        result = list(adapter.generate_stream(request=_make_request(tmp_path), credentials=creds))
+        assert result == []
+        assert adapter.last_stream_finish_reason == "stop"
+
+    def test_empty_stream_logs_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        chunks = [_make_chunk(content=None, finish_reason="stop")]
+        fake = FakeStreamAzureClient(chunks)
+        adapter = AzureOpenAIProviderAdapter(client_factory=lambda _creds: fake)
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key="key",
+            endpoint="https://x.openai.azure.com/openai/v1",
+            azure_api_mode="azure_openai_v1",
+        )
+        with caplog.at_level("WARNING"):
+            list(adapter.generate_stream(request=_make_request(tmp_path), credentials=creds))
+        assert any("empty_stream" in m for m in caplog.messages)
+
+    def test_finish_reason_captured_on_empty_content_chunk(self, tmp_path: Path) -> None:
+        chunks = [
+            _make_chunk("hi"),
+            _make_chunk(content=None, finish_reason="stop"),
+        ]
+        fake = FakeStreamAzureClient(chunks)
+        adapter = AzureOpenAIProviderAdapter(client_factory=lambda _creds: fake)
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key="key",
+            endpoint="https://x.openai.azure.com/openai/v1",
+            azure_api_mode="azure_openai_v1",
+        )
+        list(adapter.generate_stream(request=_make_request(tmp_path), credentials=creds))
+        assert adapter.last_stream_finish_reason == "stop"

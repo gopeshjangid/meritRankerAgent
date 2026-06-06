@@ -184,7 +184,7 @@ class TestStreamingFlow:
         messages = " ".join(r.message for r in caplog.records)
         assert "stream_started=true" in messages
         assert "status_emitted" in messages
-        assert "first_chunk_emitted=true" in messages
+        assert "first_visible_chunk_emitted=true" in messages
         assert "stream_completed=true" in messages
         assert "chunk_count=" in messages
         assert "latency_ms=" in messages
@@ -646,6 +646,44 @@ class TestExtendedStreamStatuses:
                 "threshold",
             ):
                 assert forbidden not in blob
+
+
+class TestEmptyGeneratorOutputStreaming:
+    class _AdapterWithEmptyChunks:
+        def generate_stream(self, **kwargs):  # noqa: ANN003
+            yield ""
+            yield "   "
+            yield "Visible answer text."
+
+    def test_empty_chunks_are_not_emitted(self) -> None:
+        events = list(
+            stream_doubt_solver(
+                StreamDoubtSolverInput(request_id=_REQUEST_ID, query="A question"),
+                adapter=self._AdapterWithEmptyChunks(),  # type: ignore[arg-type]
+            )
+        )
+        chunks = [e.content for e in events if e.type == "chunk"]
+        assert chunks == ["Visible answer text."]
+
+    def test_first_visible_chunk_not_set_for_empty_only(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        class _EmptyOnlyAdapter:
+            def generate_stream(self, **kwargs):  # noqa: ANN003
+                return
+                yield  # pragma: no cover
+
+        with caplog.at_level(logging.INFO):
+            list(
+                stream_doubt_solver(
+                    StreamDoubtSolverInput(request_id=_REQUEST_ID, query="Q"),
+                    adapter=_EmptyOnlyAdapter(),  # type: ignore[arg-type]
+                )
+            )
+        messages = " ".join(r.message for r in caplog.records)
+        assert "first_visible_chunk_emitted=true" not in messages
 
 
 class TestStreamingErrorHandling:

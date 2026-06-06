@@ -481,16 +481,53 @@ class AzureOpenAIProviderAdapter:
         try:
             stream = client.chat.completions.create(**stream_kwargs)
             finish_reason: str | None = None
+            empty_chunk_count = 0
+            text_chunk_count = 0
             for chunk in stream:
-                if not chunk.choices:
+                if chunk is None:
+                    empty_chunk_count += 1
                     continue
-                fr = getattr(chunk.choices[0], "finish_reason", None)
+                if not chunk.choices:
+                    empty_chunk_count += 1
+                    continue
+                choice = chunk.choices[0]
+                fr = getattr(choice, "finish_reason", None)
                 if fr is not None:
                     finish_reason = fr
-                delta = chunk.choices[0].delta.content or ""
-                if delta:
-                    yield delta
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    empty_chunk_count += 1
+                    continue
+                content_val = getattr(delta, "content", None)
+                if content_val:
+                    text_chunk_count += 1
+                    yield content_val
+                else:
+                    empty_chunk_count += 1
             self.last_stream_finish_reason = finish_reason or "stop"
+            if text_chunk_count == 0:
+                logger.warning(
+                    "azure_openai_provider_adapter.generate_stream  empty_stream  "
+                    "model_alias=%s  deployment=%s  route_id=%s  "
+                    "empty_chunk_count=%d  finish_reason=%s",
+                    request.model_resolution.model_alias,
+                    deployment,
+                    request.route_decision.route_id,
+                    empty_chunk_count,
+                    finish_reason or "none",
+                )
+            else:
+                logger.info(
+                    "llm_stream_normalized  route_id=%s  model_alias=%s  "
+                    "provider=azure_openai  deployment=%s  empty_chunk_count=%d  "
+                    "text_chunk_count=%d  finish_reason=%s",
+                    request.route_decision.route_id,
+                    request.model_resolution.model_alias,
+                    deployment,
+                    empty_chunk_count,
+                    text_chunk_count,
+                    finish_reason or "none",
+                )
         except Exception as exc:
             failure_kind = _classify_azure_openai_error(exc)
             _log_azure_call_failure(

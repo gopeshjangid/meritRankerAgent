@@ -194,6 +194,7 @@ def stream_doubt_solver(
         yield generating_event
 
     chunk_count = 0
+    visible_chunk_count = 0
     generator_fallback_emitted = False
     try:
         for chunk in adapter.generate_stream(
@@ -221,13 +222,30 @@ def stream_doubt_solver(
                 status_tracker.pending_events.clear()
                 generator_fallback_emitted = True
 
+            if not chunk or not chunk.strip():
+                logger.info(
+                    "answer_chunk_emission  request_id=%s  skipped_empty_chunk=true  "
+                    "first_visible_chunk_emitted=%s",
+                    request_id,
+                    first_chunk_logged,
+                )
+                continue
+
+            visible_chunk_count += 1
             chunk_count += 1
             if not first_chunk_logged:
                 first_chunk_logged = True
                 logger.info(
-                    "streaming_doubt_solver  request_id=%s  first_chunk_emitted=true",
+                    "streaming_doubt_solver  request_id=%s  first_visible_chunk_emitted=true",
                     request_id,
                 )
+            logger.info(
+                "answer_chunk_emission  request_id=%s  first_visible_chunk_emitted=%s  "
+                "chunk_chars=%d  skipped_empty_chunk=false",
+                request_id,
+                first_chunk_logged,
+                len(chunk),
+            )
             yield DoubtSolverStreamEvent(
                 type="chunk",
                 request_id=request_id,
@@ -255,9 +273,10 @@ def stream_doubt_solver(
     latency_ms = int((time.monotonic() - started_at) * 1000)
     logger.info(
         "streaming_doubt_solver  request_id=%s  stream_completed=true  "
-        "stage=complete  chunk_count=%d  latency_ms=%d",
+        "stage=complete  chunk_count=%d  visible_chunk_count=%d  latency_ms=%d",
         request_id,
         chunk_count,
+        visible_chunk_count,
         latency_ms,
     )
 

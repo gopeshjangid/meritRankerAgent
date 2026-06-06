@@ -30,6 +30,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _is_visible_text(chunk: str) -> bool:
+    """True when a stream chunk contains user-visible answer text."""
+    return bool(chunk and chunk.strip())
+
+
+def _log_generation_empty_output(
+    *,
+    route_id: str,
+    model_alias: str,
+    provider: str | None,
+    deployment: str | None,
+    finish_reason: str | None,
+    visible_chunk_count: int,
+    failure_kind: str,
+    fallback_eligible: bool,
+    fallback_attempted: bool = False,
+) -> None:
+    """Log empty generator output diagnostics (no chunk content)."""
+    logger.warning(
+        "generation_empty_output  route_id=%s  model_alias=%s  provider=%s  "
+        "deployment=%s  finish_reason=%s  visible_chunk_count=%d  "
+        "first_visible_chunk_emitted=false  failure_kind=%s  "
+        "fallback_eligible=%s  fallback_attempted=%s",
+        route_id,
+        model_alias,
+        provider or "",
+        deployment or "",
+        finish_reason or "none",
+        visible_chunk_count,
+        failure_kind,
+        fallback_eligible,
+        fallback_attempted,
+    )
+
+
 @runtime_checkable
 class ProviderExecutor(Protocol):
     """Boundary for provider adapters used by RegistryBackedModelExecutor."""
@@ -141,7 +176,25 @@ class RegistryBackedModelExecutor:
         # --- Try primary model ---
         primary_failure_kind: str | None = None
         try:
-            return self._provider_executor.execute(primary_request)
+            raw_result = self._provider_executor.execute(primary_request)
+            if not _is_visible_text(raw_result.content):
+                _log_generation_empty_output(
+                    route_id=route_decision.route_id,
+                    model_alias=model_resolution.model_alias,
+                    provider=model_resolution.provider,
+                    deployment=model_resolution.model_config.deployment,
+                    finish_reason=raw_result.finish_reason,
+                    visible_chunk_count=0,
+                    failure_kind="empty_answer",
+                    fallback_eligible=True,
+                )
+                raise LlmProviderExecutionError(
+                    "Provider returned empty answer content.",
+                    failure_kind="empty_answer",
+                    provider=model_resolution.provider,
+                    model_alias=primary_alias,
+                )
+            return raw_result
         except LlmProviderExecutionError as exc:
             if exc.failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
                 # Not a retryable provider failure — wrap and raise immediately.
@@ -203,6 +256,14 @@ class RegistryBackedModelExecutor:
 
             try:
                 raw_result = self._provider_executor.execute(fallback_request)
+                if not _is_visible_text(raw_result.content):
+                    attempted.append(fallback_alias)
+                    logger.warning(
+                        "registry_backed_model_executor.execute  fallback_empty_answer  "
+                        "fallback_alias=%s — skipping",
+                        fallback_alias,
+                    )
+                    continue
                 # Build a new result that records the fallback provenance safely.
                 result = ModelExecutionResult(
                     content=raw_result.content,
@@ -283,11 +344,33 @@ class RegistryBackedModelExecutor:
 
         primary_failure_kind: str | None = None
         self.last_stream_finish_reason = None
+        visible_chunk_count = 0
         try:
-            yield from self._provider_executor.execute_stream(primary_request)
+            for chunk in self._provider_executor.execute_stream(primary_request):
+                if _is_visible_text(chunk):
+                    visible_chunk_count += 1
+                    yield chunk
             self.last_stream_finish_reason = getattr(
                 self._provider_executor, "last_stream_finish_reason", "stop"
             )
+            if visible_chunk_count == 0:
+                finish_reason = self.last_stream_finish_reason
+                _log_generation_empty_output(
+                    route_id=route_decision.route_id,
+                    model_alias=model_resolution.model_alias,
+                    provider=model_resolution.provider,
+                    deployment=model_resolution.model_config.deployment,
+                    finish_reason=finish_reason,
+                    visible_chunk_count=0,
+                    failure_kind="empty_stream",
+                    fallback_eligible=True,
+                )
+                raise LlmProviderExecutionError(
+                    "Provider stream returned no visible text chunks.",
+                    failure_kind="empty_stream",
+                    provider=model_resolution.provider,
+                    model_alias=primary_alias,
+                )
             return
         except LlmProviderExecutionError as exc:
             if exc.failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
@@ -351,15 +434,28 @@ class RegistryBackedModelExecutor:
             )
 
             try:
+                fallback_visible = 0
                 if hasattr(self._provider_executor, "execute_stream"):
-                    yield from self._provider_executor.execute_stream(fallback_request)
+                    for chunk in self._provider_executor.execute_stream(fallback_request):
+                        if _is_visible_text(chunk):
+                            fallback_visible += 1
+                            yield chunk
                     self.last_stream_finish_reason = getattr(
                         self._provider_executor, "last_stream_finish_reason", "stop"
                     )
                 else:
                     result = self._provider_executor.execute(fallback_request)
-                    yield result.content
+                    if _is_visible_text(result.content):
+                        fallback_visible = 1
+                        yield result.content
                     self.last_stream_finish_reason = result.finish_reason
+                if fallback_visible == 0:
+                    logger.warning(
+                        "registry_backed_model_executor.execute_stream  fallback_empty_stream  "
+                        "fallback_alias=%s — skipping",
+                        fallback_alias,
+                    )
+                    continue
                 logger.info(
                     "registry_backed_model_executor.execute_stream  fallback_succeeded  "
                     "fallback_alias=%s  provider=%s  failure_kind=%s",

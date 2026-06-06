@@ -58,6 +58,7 @@ from services.doubt_solver.answer_quality import (
     apply_safe_sanitizer,
     build_rewrite_messages,
     detect_final_answer,
+    generation_failure_message,
     log_answer_quality_rewrite,
     log_answer_quality_validation,
     plain_text_fallback,
@@ -69,6 +70,7 @@ from services.llm.orchestration.errors import (
     LlmExecutionError,
     LlmOrchestrationError,
     LlmOrchestratorError,
+    ProviderExecutionError,
 )
 from services.llm.orchestration.prompt_resolver import PromptResolver, get_prompt_resolver
 from services.llm.orchestration.route_resolver import resolve_route
@@ -280,6 +282,19 @@ class LlmOrchestrator:
             intent=route_request.intent,
             policy=quality_policy,
         )
+        if quality.severity == "error":
+            log_answer_quality_validation(
+                request_id=request_id,
+                route_id=route_decision.route_id,
+                subject=route_decision.subject,
+                difficulty=route_decision.difficulty,
+                intent=route_request.intent,
+                result=quality,
+                output_chars=len(working),
+                rewrite_required=False,
+                sanitized=False,
+            )
+            return generation_failure_message(), False
         rewrite_required = quality.severity in ("rewrite_required", "unsafe")
         log_answer_quality_validation(
             request_id=request_id,
@@ -520,6 +535,8 @@ class LlmOrchestrator:
             else:
                 marker_found = has_completion_marker(content, policy.marker)
                 final_content = strip_completion_marker(content, policy.marker)
+                if not final_content.strip():
+                    final_content = generation_failure_message()
                 log_answer_completion(
                     request_id=route_request.request_id,
                     finish_reason=finish_reason,
@@ -621,6 +638,7 @@ class LlmOrchestrator:
         finish_reason: str | None = None
         streamed_parts: list[str] = []
         buffer_for_quality = is_generator and quality_policy.validation_enabled
+        visible_emitted = False
 
         chunk_count = 0
         marker_filter = StreamingMarkerFilter(policy.marker) if is_generator else None
@@ -635,17 +653,33 @@ class LlmOrchestrator:
                     clean = marker_filter.feed(chunk)
                 else:
                     clean = chunk
-                if clean:
+                if clean and clean.strip():
+                    visible_emitted = True
                     streamed_parts.append(clean)
                     if not buffer_for_quality:
                         yield clean
             if marker_filter is not None:
                 tail = marker_filter.flush()
-                if tail:
+                if tail and tail.strip():
+                    visible_emitted = True
                     streamed_parts.append(tail)
                     if not buffer_for_quality:
                         yield tail
             finish_reason = getattr(self._model_executor, "last_stream_finish_reason", None)
+        except ProviderExecutionError as exc:
+            if is_generator and not visible_emitted:
+                logger.warning(
+                    "llm_orchestrator.generate_stream  all_attempts_empty  route_id=%s  "
+                    "model=%s — emitting safe failure message",
+                    route_decision.route_id,
+                    route_decision.model,
+                )
+                yield generation_failure_message()
+                return
+            raise LlmExecutionError(
+                f"Model stream failed for route '{route_decision.route_id}': "
+                f"{type(exc).__name__}"
+            ) from exc
         except LlmOrchestrationError:
             raise
         except Exception as exc:
@@ -655,6 +689,17 @@ class LlmOrchestrator:
             ) from exc
 
         partial_content = "".join(streamed_parts)
+        if not visible_emitted:
+            logger.warning(
+                "llm_orchestrator.generate_stream  empty_stream  route_id=%s  model=%s  "
+                "finish_reason=%s — no visible text chunks received from provider",
+                route_decision.route_id,
+                route_decision.model,
+                finish_reason or "none",
+            )
+            if is_generator:
+                yield generation_failure_message()
+                return
         provider_hint = "mock" if isinstance(self._model_executor, MockModelExecutor) else None
         if should_run_continuation(
             partial_content,
@@ -690,12 +735,14 @@ class LlmOrchestrator:
                 ):
                     chunk_count += 1
                     clean = cont_filter.feed(chunk)
-                    if clean:
+                    if clean and clean.strip():
+                        visible_emitted = True
                         streamed_parts.append(clean)
                         if not buffer_for_quality:
                             yield clean
                 cont_tail = cont_filter.flush()
-                if cont_tail:
+                if cont_tail and cont_tail.strip():
+                    visible_emitted = True
                     streamed_parts.append(cont_tail)
                     if not buffer_for_quality:
                         yield cont_tail
@@ -726,7 +773,10 @@ class LlmOrchestrator:
                     continuation_attempts=continuation_attempts,
                 )
                 if buffer_for_quality:
-                    yield final_content
+                    if final_content.strip():
+                        yield final_content
+                    else:
+                        yield generation_failure_message()
             else:
                 final_content = strip_completion_marker(raw_content, policy.marker)
                 log_answer_completion(

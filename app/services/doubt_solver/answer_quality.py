@@ -13,7 +13,11 @@ from schemas.llm import LlmMessage
 
 logger = logging.getLogger(__name__)
 
-Severity = Literal["clean", "minor", "rewrite_required", "unsafe"]
+Severity = Literal["clean", "minor", "rewrite_required", "unsafe", "error"]
+
+GENERATION_FAILURE_MESSAGE = (
+    "I could not generate a reliable answer for this question. Please try again."
+)
 
 REWRITE_USER_PROMPT = (
     "Rewrite the answer into the required compact format. Keep only the final clean "
@@ -117,7 +121,13 @@ def validate_answer_quality(
 ) -> AnswerQualityResult:
     """Run deterministic checks on generator output (before marker strip)."""
     pol = policy or AnswerQualityPolicy.from_settings()
-    if not pol.validation_enabled or not content.strip():
+    if not content.strip():
+        return AnswerQualityResult(
+            is_valid=False,
+            severity="error",
+            reason_codes=["empty_answer"],
+        )
+    if not pol.validation_enabled:
         return AnswerQualityResult(is_valid=True, severity="clean", reason_codes=[])
 
     reasons: list[str] = []
@@ -291,6 +301,16 @@ def plain_text_fallback(*, subject: str) -> str:
     )
 
 
+def generation_failure_message() -> str:
+    """Safe user-facing message when all generation attempts fail or return empty."""
+    return GENERATION_FAILURE_MESSAGE
+
+
+def fallback_required_for_result(result: AnswerQualityResult) -> bool:
+    """True when quality result indicates model-level fallback should be attempted."""
+    return "empty_answer" in result.reason_codes
+
+
 def log_answer_quality_validation(
     *,
     request_id: str,
@@ -306,7 +326,8 @@ def log_answer_quality_validation(
     logger.info(
         "answer_quality_validation  request_id=%s  route_id=%s  subject=%s  "
         "difficulty=%s  intent=%s  is_valid=%s  severity=%s  reasons_count=%d  "
-        "reason_codes=%s  output_chars=%d  rewrite_required=%s  sanitized=%s",
+        "reason_codes=%s  output_chars=%d  rewrite_required=%s  sanitized=%s  "
+        "fallback_required=%s",
         request_id,
         route_id,
         subject,
@@ -319,6 +340,7 @@ def log_answer_quality_validation(
         output_chars,
         rewrite_required,
         sanitized,
+        fallback_required_for_result(result),
     )
 
 

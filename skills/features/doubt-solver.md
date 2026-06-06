@@ -103,6 +103,18 @@ Priority: **accuracy > cost > speed > provider reliability**. Classifier routes 
 - Safe log: `llm_payload_shaped` with `token_budget_param`, `dropped_params`, `reasoning_param_sent` (no messages/bodies/keys).
 - `unsupported_parameter` provider errors are fallback-eligible (pre-first-chunk stream fallback preserved).
 
+**Azure o4-mini stream ValidationError fix (latest):**
+- Root cause: Azure o4-mini accepted the payload (HTTP 200) but streamed zero user-visible text chunks. Continuation on empty `partial_content` caused Pydantic ValidationError.
+- Fix: continuation blocked for empty/whitespace base answer; defensive Azure stream chunk parsing.
+
+**Empty generator output handling (latest):**
+- Empty/whitespace generator output is **never valid** — `severity=error`, `reason_code=empty_answer`, `fallback_required=true`.
+- Empty stream before first visible chunk triggers model-level fallback (`empty_stream` / `empty_answer` failure kinds).
+- Empty chunks (`""`, whitespace) are not emitted to the client.
+- `first_visible_chunk_emitted=true` only after non-empty answer text is emitted (not status/empty events).
+- If all models return empty, client receives safe message: *"I could not generate a reliable answer for this question. Please try again."*
+- Azure o4-mini may return HTTP 200 with zero visible text chunks — fallback chain (o3 → DeepSeek v4pro) is attempted automatically.
+
 **Streaming:** classifiers `supports_streaming=false`; generators stream when `supports_streaming=true`.
 
 
