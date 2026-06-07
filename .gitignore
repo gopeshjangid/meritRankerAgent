@@ -1,34 +1,56 @@
 # ============================================================================
-# meritRankerTutor — root .gitignore
+# MeritRanker Agent Python — root .gitignore
 # ============================================================================
 
-# Python virtualenvs
+# Python virtual environments
 .venv/
 venv/
 env/
+.env/
 
-# Python cache
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
+*.so
 
-# Test / lint caches
+# Test, lint, and type-check caches
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .coverage
 htmlcov/
+.tox/
+.nox/
+
+# Build and distribution artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+wheels/
 
 # Secrets — NEVER commit these
-.env
 .env.local
 app/.env
 app/.env.local
+agentcore/.env.local
 
-# AgentCore CLI internals (logs, temp state)
+# AgentCore CLI internals
 agentcore/.cli/logs/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
 
 # macOS
 .DS_Store
@@ -36,11 +58,13 @@ agentcore/.cli/logs/
 # Local development data
 local-data/
 
+# Cursor / local agent assets (optional local paths)
+.cursor/projects/
+
 # ============================================================================
 # Do NOT ignore (must be committed):
-#   pyproject.toml
-#   uv.lock
+#   app/pyproject.toml
+#   app/uv.lock
 #   agentcore/agentcore.json
 #   agentcore/aws-targets.json
-#   agentcore/.cli/deployed-state.json  ← managed by agentcore/.gitignore
 # ============================================================================
